@@ -1,0 +1,13 @@
+version: "0.0.1"
+description: Helper tool to determine display configuration
+url: https://github.com/georgik/esp32-display-config-finder 
+
+targets:
+  - esp32p4
+
+tags:
+  - bsp
+
+dependencies:
+  idf: ">=5.3"
+  esp_lcd_ili9881c: "1.*"

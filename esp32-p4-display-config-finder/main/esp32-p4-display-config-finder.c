@@ -14,7 +14,7 @@
 #include "argtable3/argtable3.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_lcd_dsi.h"
+//#include "esp_lcd_dsi.h"
 #include "esp_lcd_ili9881c.h"
 #include "sdkconfig.h"
 
