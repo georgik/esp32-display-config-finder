@@ -1,13 +1,7 @@
-version: "0.0.1"
-description: Helper tool to determine display configuration
-url: https://github.com/georgik/esp32-display-config-finder 
-
-targets:
-  - esp32p4
-
-tags:
-  - bsp
+description: BSP Display example
 
 dependencies:
-  idf: ">=5.3"
-  esp_lcd_ili9881c: "1.*"
+  esp32_p4_function_ev_board:
+    version: '*'
+    override_path: ../../../bsp/esp32_p4_function_ev_board
+  espressif/console_simple_init: ^1.1.0

@@ -1,256 +1,354 @@
 /*
- * ESP-IDF app: Interactive shell for tuning ILI9881C 1280x800 panel parameters
- * Accepts commands over idf.py monitor via esp_console
+ * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-License-Identifier: CC0-1.0
+ *
+ * Interactive shell for tuning ILI9881C 1280x800 panel at runtime.
  */
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "esp_vfs_dev.h"
-#include "esp_console.h"
-#include "linenoise/linenoise.h"
-#include "argtable3/argtable3.h"
+#include "esp_event.h"
+#include "console_simple_init.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-//#include "esp_lcd_dsi.h"
+#include "esp_lcd_panel_commands.h"
+#include "esp_lcd_panel_interface.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_ili9881c.h"
 #include "sdkconfig.h"
+#include "bsp/esp-bsp.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_ldo_regulator.h"
 
-static const char* TAG = "disp_shell";
+static const char *TAG = "disp_shell";
 
-// Default panel parameters (modifiable via shell)
+static volatile bool panel_running = false;
+
+static SemaphoreHandle_t draw_done_sem = NULL;
+
+// Callback invoked when a color transfer completes
+static bool color_trans_done_cb(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(draw_done_sem, &xHigherPriorityTaskWoken);
+    return true;
+}
+
+// Runtime-configurable panel parameters
 static struct {
-    int dpi_clock_freq_mhz;
-    int h_size;
-    int v_size;
-    int hsync_pw;
-    int hsync_bp;
-    int hsync_fp;
-    int vsync_pw;
-    int vsync_bp;
-    int vsync_fp;
-    int lane_num;
+    int dpi_clock_mhz;
+    int h_size, v_size;
+    int hs_pw, hs_bp, hs_fp;
+    int vs_pw, vs_bp, vs_fp;
+    int lanes;
+    int lane_rate_mbps;
+    int ldo_vci_chan;
+    int ldo_vci_mv;
+    int ldo_iovcc_chan;
+    int ldo_iovcc_mv;
 } panel_cfg = {
-    .dpi_clock_freq_mhz = 71,
-    .h_size             = 1280,
-    .v_size             = 800,
-    .hsync_pw           = 40,
-    .hsync_bp           = 140,
-    .hsync_fp           = 40,
-    .vsync_pw           = 4,
-    .vsync_bp           = 16,
-    .vsync_fp           = 16,
-    .lane_num           = 4,
+    .dpi_clock_mhz = 80,
+    .h_size        = 1280,
+    .v_size        = 800,
+    .hs_pw         = 16,
+    .hs_bp         = 172,
+    .hs_fp         = 32,
+    .vs_pw         = 4,
+    .vs_bp         = 40,
+    .vs_fp         = 26,
+    .lanes         = 2, // P4: max 2 lanes
+    .lane_rate_mbps = 0,
+    .ldo_vci_chan   = 3,    // default VCI LDO channel
+    .ldo_vci_mv     = 2700, // default analog voltage (mV)
+    .ldo_iovcc_chan = 2,    // default IOVCC LDO channel
+    .ldo_iovcc_mv   = 1900, // default logic voltage (mV)
 };
 
 // LCD handles
-static esp_lcd_dsi_bus_handle_t dsi_bus = NULL;
+static esp_lcd_dsi_bus_handle_t   dsi_bus    = NULL;
 static esp_lcd_panel_io_handle_t io_handle = NULL;
-static esp_lcd_panel_handle_t panel     = NULL;
+static esp_lcd_panel_handle_t ctrl_panel = NULL;
+static esp_lcd_panel_handle_t data_panel = NULL;
 
 // Forward declarations
-static void init_panel_and_draw_blue(void);
-static int cmd_show(int argc, char** argv);
-static int cmd_set(int argc, char** argv);
-static int cmd_init(int argc, char** argv);
+static void panel_loop(void *pvParameters);
 
-// "show" command: print current config
+// 'show' command: display current config
 static int cmd_show(int argc, char** argv) {
-    ESP_LOGI(TAG, "Current panel parameters:");
-    ESP_LOGI(TAG, " dpi_clock_freq_mhz: %d", panel_cfg.dpi_clock_freq_mhz);
-    ESP_LOGI(TAG, " h_size: %d, v_size: %d", panel_cfg.h_size, panel_cfg.v_size);
-    ESP_LOGI(TAG, " hsync: pw=%d bp=%d fp=%d", panel_cfg.hsync_pw, panel_cfg.hsync_bp, panel_cfg.hsync_fp);
-    ESP_LOGI(TAG, " vsync: pw=%d bp=%d fp=%d", panel_cfg.vsync_pw, panel_cfg.vsync_bp, panel_cfg.vsync_fp);
-    ESP_LOGI(TAG, " lane_num: %d", panel_cfg.lane_num);
+    ESP_LOGI(TAG, "Panel config:");
+    ESP_LOGI(TAG, "  dpi_clock_mhz=%d", panel_cfg.dpi_clock_mhz);
+    ESP_LOGI(TAG, "  size=%dx%d", panel_cfg.h_size, panel_cfg.v_size);
+    ESP_LOGI(TAG, "  hsync pw=%d bp=%d fp=%d", panel_cfg.hs_pw, panel_cfg.hs_bp, panel_cfg.hs_fp);
+    ESP_LOGI(TAG, "  vsync pw=%d bp=%d fp=%d", panel_cfg.vs_pw, panel_cfg.vs_bp, panel_cfg.vs_fp);
+    ESP_LOGI(TAG, "  lanes=%d", panel_cfg.lanes);
+    ESP_LOGI(TAG, "  lane_rate_mbps=%d", panel_cfg.lane_rate_mbps ? panel_cfg.lane_rate_mbps : (panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2)));
+    ESP_LOGI(TAG, "  ldo_vci_chan=%d, ldo_vci_mv=%d", panel_cfg.ldo_vci_chan, panel_cfg.ldo_vci_mv);
+    ESP_LOGI(TAG, "  ldo_iovcc_chan=%d, ldo_iovcc_mv=%d", panel_cfg.ldo_iovcc_chan, panel_cfg.ldo_iovcc_mv);
     return 0;
 }
 
-// "set" command: set a parameter
+// 'set' command: modify a parameter
 static int cmd_set(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: set <param> <value>\n");
         return 0;
     }
-    const char* param = argv[1];
-    int value = atoi(argv[2]);
-    if      (strcmp(param, "dpi_clock") == 0) panel_cfg.dpi_clock_freq_mhz = value;
-    else if (strcmp(param, "h_size") == 0)    panel_cfg.h_size = value;
-    else if (strcmp(param, "v_size") == 0)    panel_cfg.v_size = value;
-    else if (strcmp(param, "hs_pw") == 0)     panel_cfg.hsync_pw = value;
-    else if (strcmp(param, "hs_bp") == 0)     panel_cfg.hsync_bp = value;
-    else if (strcmp(param, "hs_fp") == 0)     panel_cfg.hsync_fp = value;
-    else if (strcmp(param, "vs_pw") == 0)     panel_cfg.vsync_pw = value;
-    else if (strcmp(param, "vs_bp") == 0)     panel_cfg.vsync_bp = value;
-    else if (strcmp(param, "vs_fp") == 0)     panel_cfg.vsync_fp = value;
-    else if (strcmp(param, "lanes") == 0)     panel_cfg.lane_num = value;
+    const char *p = argv[1];
+    int v = atoi(argv[2]);
+    if      (strcmp(p, "dpi") == 0) panel_cfg.dpi_clock_mhz = v;
+    else if (strcmp(p, "hsize")==0) panel_cfg.h_size        = v;
+    else if (strcmp(p, "vsize")==0) panel_cfg.v_size        = v;
+    else if (strcmp(p, "hs_pw")==0) panel_cfg.hs_pw         = v;
+    else if (strcmp(p, "hs_bp")==0) panel_cfg.hs_bp         = v;
+    else if (strcmp(p, "hs_fp")==0) panel_cfg.hs_fp         = v;
+    else if (strcmp(p, "vs_pw")==0) panel_cfg.vs_pw         = v;
+    else if (strcmp(p, "vs_bp")==0) panel_cfg.vs_bp         = v;
+    else if (strcmp(p, "vs_fp")==0) panel_cfg.vs_fp         = v;
+    else if (strcmp(p, "lanes")==0) panel_cfg.lanes         = v;
+    else if (strcmp(p, "lane_rate") == 0) panel_cfg.lane_rate_mbps = v;
+    else if (strcmp(p, "vci_chan")==0)   panel_cfg.ldo_vci_chan   = v;
+    else if (strcmp(p, "vci_mv")==0)     panel_cfg.ldo_vci_mv     = v;
+    else if (strcmp(p, "iovcc_chan")==0) panel_cfg.ldo_iovcc_chan = v;
+    else if (strcmp(p, "iovcc_mv")==0)   panel_cfg.ldo_iovcc_mv   = v;
     else {
-        printf("Unknown param '%s'\n", param);
+        printf("Unknown param '%s'\n", p);
         return 0;
     }
-    ESP_LOGI(TAG, "Set %s to %d", param, value);
+    ESP_LOGI(TAG, "Set %s = %d", p, v);
     return 0;
 }
 
-// "init" command: initialize or reconfigure the panel and draw blue
-static int cmd_init(int argc, char** argv) {
-    init_panel_and_draw_blue();
+// 'start' command: re-init panel with current settings and start continuous draw loop
+static int cmd_start(int argc, char** argv) {
+    BaseType_t res = xTaskCreate(
+        panel_loop,
+        "panel_loop",
+        8192,
+        NULL,
+        tskIDLE_PRIORITY + 1,
+        NULL
+    );
+    if (res != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start panel task");
+    }
     return 0;
 }
 
-// Register console commands
-static void register_console_commands(void) {
-    const esp_console_cmd_t show_cmd = {
-        .command = "show",
-        .help = "Show current panel configuration",
-        .hint = NULL,
-        .func = &cmd_show,
-    };
-    esp_console_cmd_register(&show_cmd);
-
-    const esp_console_cmd_t set_cmd = {
-        .command = "set",
-        .help = "Set panel parameter: dpi_clock,h_size,v_size,hs_pw,hs_bp,hs_fp,vs_pw,vs_bp,vs_fp,lanes",
-        .hint = "<param> <value>",
-        .func = &cmd_set,
-    };
-    esp_console_cmd_register(&set_cmd);
-
-    const esp_console_cmd_t init_cmd = {
-        .command = "init",
-        .help = "Initialize panel with current config and fill blue",
-        .hint = NULL,
-        .func = &cmd_init,
-    };
-    esp_console_cmd_register(&init_cmd);
+// 'stop' command: stop continuous draw loop
+static int cmd_stop(int argc, char** argv) {
+    panel_running = false;
+    ESP_LOGI(TAG, "Panel stop requested");
+    return 0;
 }
 
-// Console setup over UART0
-static void init_console(void) {
-    /* Disable buffering on stdin and stdout */
-    setvbuf(stdin, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IONBF, 0);
+static void panel_loop(void *pvParameters) {
+    esp_err_t ret = ESP_OK;
+    panel_running = true;
 
-    /* Configure UART */
-    const uart_config_t uart_config = {
-        .baud_rate = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    // Power up MIPI DSI PHY: analog (VCI) and logic (IOVCC) rails
+    esp_ldo_channel_handle_t ldo_vci = NULL;
+    esp_ldo_channel_config_t ldo_vci_cfg = {
+        .chan_id    = panel_cfg.ldo_vci_chan,
+        .voltage_mv = panel_cfg.ldo_vci_mv,
     };
-    ESP_ERROR_CHECK(uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 0, NULL, 0));
-    esp_vfs_dev_uart_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
-
-    /* Initialize console */
-    esp_console_config_t console_config = { .max_cmdline_args = 8, .max_cmdline_length = 128 }; 
-    ESP_ERROR_CHECK(esp_console_init(&console_config));
-
-    /* Enable linenoise for line editing */
-    linenoiseSetMultiLine(1);
-    linenoiseHistorySetMaxLen(100);
-}
-
-// Helper: init or re-init panel & draw solid blue
-static void init_panel_and_draw_blue(void) {
-    ESP_LOGI(TAG, "Initializing panel...");
-    // If already initialized, delete old
-    if (panel) {
-        esp_lcd_panel_del(panel);
-        panel = NULL;
-    }
-    if (io_handle) {
-        esp_lcd_panel_io_del(io_handle);
-        io_handle = NULL;
-    }
-    if (dsi_bus) {
-        esp_lcd_del_dsi_bus(dsi_bus);
-        dsi_bus = NULL;
+    ret = esp_ldo_acquire_channel(&ldo_vci_cfg, &ldo_vci);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to acquire VCI LDO chan %d at %dmV: %s",
+                 panel_cfg.ldo_vci_chan, panel_cfg.ldo_vci_mv, esp_err_to_name(ret));
     }
 
-    // 1: create DSI bus
+
+    esp_ldo_channel_handle_t ldo_iovcc = NULL;
+    esp_ldo_channel_config_t ldo_iovcc_cfg = {
+        .chan_id    = panel_cfg.ldo_iovcc_chan,
+        .voltage_mv = panel_cfg.ldo_iovcc_mv,
+    };
+    ret = esp_ldo_acquire_channel(&ldo_iovcc_cfg, &ldo_iovcc);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to acquire IOVCC LDO chan %d at %dmV: %s",
+                 panel_cfg.ldo_iovcc_chan, panel_cfg.ldo_iovcc_mv, esp_err_to_name(ret));
+    }
+
+    ESP_LOGI(TAG, "Reconfiguring panel...");
+    // teardown if already running
+    if (ctrl_panel) { esp_lcd_panel_del(ctrl_panel); ctrl_panel = NULL; }
+    if (data_panel) { esp_lcd_panel_del(data_panel); data_panel = NULL; }
+    if (io_handle)  { esp_lcd_panel_io_del(io_handle); io_handle = NULL; }
+    if (dsi_bus)    { esp_lcd_del_dsi_bus(dsi_bus);     dsi_bus = NULL; }
+
+    // Calculate lane bit rate based on pixel clock (MHz), bits per pixel (24 for RGB888), and number of lanes
+    int default_rate = panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2);
+    int lane_rate_mbps = panel_cfg.lane_rate_mbps > 0 ? panel_cfg.lane_rate_mbps : default_rate;
+    ESP_LOGI(TAG, "DSI lane bit rate: %d Mbps (default %d)", lane_rate_mbps, default_rate);
+
+    // 1) DSI bus
     esp_lcd_dsi_bus_config_t bus_cfg = {
-        .bus_id            = 0,
-        .phy_clk_src       = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
-        .lane_bit_rate_mbps= panel_cfg.dpi_clock_freq_mhz,
+        .bus_id             = 0,
+        .num_data_lanes     = panel_cfg.lanes,     // number of DSI data lanes
+        .phy_clk_src        = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
+        .lane_bit_rate_mbps = lane_rate_mbps,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_cfg, &dsi_bus));
+    ret = esp_lcd_new_dsi_bus(&bus_cfg, &dsi_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create DSI bus: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "DSI bus created successfully");
 
-    // 2: create DBI-over-DSI I/O
-    esp_lcd_dbi_io_config_t dbi_cfg = { .virtual_channel=0, .lcd_cmd_bits=8, .lcd_param_bits=8 };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_cfg, &io_handle));
+    // Create DBI IO for control commands
+    esp_lcd_dbi_io_config_t dbi_cfg = {
+        .virtual_channel = 0,
+        .lcd_cmd_bits    = 8,
+        .lcd_param_bits  = 8,
+    };
+    ret = esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_cfg, &io_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create DBI IO: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "DBI IO created");
 
-    // 3: DPI timing
+    // DPI timing
     esp_lcd_dpi_panel_config_t dpi_cfg = {
-        .clk_src            = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = panel_cfg.dpi_clock_freq_mhz,
+        .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
+        .dpi_clock_freq_mhz = panel_cfg.dpi_clock_mhz,
         .virtual_channel    = 0,
         .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
         .num_fbs            = 1,
         .video_timing = {
             .h_size            = panel_cfg.h_size,
             .v_size            = panel_cfg.v_size,
-            .hsync_pulse_width = panel_cfg.hsync_pw,
-            .hsync_back_porch  = panel_cfg.hsync_bp,
-            .hsync_front_porch = panel_cfg.hsync_fp,
-            .vsync_pulse_width = panel_cfg.vsync_pw,
-            .vsync_back_porch  = panel_cfg.vsync_bp,
-            .vsync_front_porch = panel_cfg.vsync_fp,
+            .hsync_pulse_width = panel_cfg.hs_pw,
+            .hsync_back_porch  = panel_cfg.hs_bp,
+            .hsync_front_porch = panel_cfg.hs_fp,
+            .vsync_pulse_width = panel_cfg.vs_pw,
+            .vsync_back_porch  = panel_cfg.vs_bp,
+            .vsync_front_porch = panel_cfg.vs_fp,
         },
-        .flags.use_dma2d     = true,
+        .flags.use_dma2d   = true,
     };
 
-    // 4: vendor config
+    // Vendor config
     ili9881c_vendor_config_t vendor_cfg = {
-        .mipi_config = { .dsi_bus = dsi_bus, .dpi_config = &dpi_cfg, .lane_num = panel_cfg.lane_num }
+        .mipi_config = { .dsi_bus = dsi_bus, .dpi_config = &dpi_cfg, .lane_num = panel_cfg.lanes }
     };
 
-    // 5: panel dev config
-    esp_lcd_panel_dev_config_t panel_dev_cfg = {
+    // Install control panel driver
+    esp_lcd_panel_dev_config_t ctrl_cfg = {
         .reset_gpio_num = BSP_LCD_RST,
         .rgb_ele_order  = BSP_LCD_COLOR_SPACE,
         .bits_per_pixel = 24,
-        .vendor_config  = &vendor_cfg,
+        .vendor_config  = &vendor_cfg,  // reuse vendor_cfg
     };
-
-    // 6: init panel
-    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9881c(io_handle, &panel_dev_cfg, &panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
-
-    ESP_LOGI(TAG, "Drawing solid blue...");
-    // allocate a small tile (e.g. 16x16) and tile it, or fill full
-    size_t px_count = panel_cfg.h_size * panel_cfg.v_size;
-    size_t buf_size = px_count * 3;
-    uint8_t *buf = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
-    for (size_t i = 0; i < buf_size; i += 3) {
-        buf[i+0] = 0x00; // R
-        buf[i+1] = 0x00; // G
-        buf[i+2] = 0xFF; // B
+    ESP_LOGI(TAG, "Creating ILI9881C control panel...");
+    ret = esp_lcd_new_panel_ili9881c(io_handle, &ctrl_cfg, &ctrl_panel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Control panel creation failed: %s", esp_err_to_name(ret));
+        return;
     }
-    // draw the full screen
-    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, buf));
-    free(buf);
-}
+    ESP_LOGI(TAG, "Control panel created");
 
-void app_main(void) {
-    ESP_LOGI(TAG, "Starting console display shell...");
-    init_console();
-    register_console_commands();
-    linenoiseClearScreen();
+    ESP_LOGI(TAG, "Resetting control panel...");
+    ret = esp_lcd_panel_reset(ctrl_panel);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Control reset failed: %s", esp_err_to_name(ret)); return; }
+    ESP_LOGI(TAG, "Init control panel...");
+    ret = esp_lcd_panel_init(ctrl_panel);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Control init failed: %s", esp_err_to_name(ret)); return; }
+    ESP_LOGI(TAG, "Turning on control panel display...");
+    ret = esp_lcd_panel_disp_on_off(ctrl_panel, true);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Control display on failed: %s", esp_err_to_name(ret)); return; }
 
-    // Shell loop
-    while (true) {
-        char *line = linenoise("disp> ");
-        if (line == NULL) continue;
-        if (strlen(line) > 0) {
-            esp_console_run(line, NULL);
-            linenoiseHistoryAdd(line);
+    // Create DPI data panel for pixel transfers
+    ESP_LOGI(TAG, "Creating DPI data panel...");
+    ret = esp_lcd_new_panel_dpi(dsi_bus, &dpi_cfg, &data_panel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DPI panel creation failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "DPI panel created");
+    ESP_LOGI(TAG, "Init DPI panel...");
+    ret = esp_lcd_panel_init(data_panel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DPI init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    // Create binary semaphore for draw completion
+    draw_done_sem = xSemaphoreCreateBinary();
+    if (!draw_done_sem) {
+        ESP_LOGE(TAG, "Failed to create draw_done_sem");
+    } else {
+        esp_lcd_dpi_panel_event_callbacks_t cbs = {
+            .on_color_trans_done = color_trans_done_cb,
+        };
+        ESP_ERROR_CHECK(esp_lcd_dpi_panel_register_event_callbacks(data_panel, &cbs, NULL));
+    }
+
+    ESP_LOGI(TAG, "Filling screen with blue (full-frame buffer)");
+    // Allocate full-frame buffer in PSRAM (32MB available)
+    size_t total_px = panel_cfg.h_size * panel_cfg.v_size;
+    size_t buf_sz = total_px * 3; // RGB888
+    ESP_LOGI(TAG, "Allocating full-frame buffer of %u bytes", buf_sz);
+    uint8_t *buf = heap_caps_malloc(buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!buf) {
+        ESP_LOGE(TAG, "Failed to allocate full-frame buffer: %u bytes", buf_sz);
+        return;
+    }
+    // Fill buffer with blue pixels (R=0, G=0, B=255)
+    for (size_t i = 0; i < buf_sz; i += 3) {
+        buf[i + 0] = 0xFF;
+        buf[i + 1] = 0xAA;
+        buf[i + 2] = 0xFF;
+    }
+    ESP_LOGI(TAG, "Drawing full-frame bitmap...");
+
+    // Continuous draw loop
+    while (panel_running) {
+        ret = esp_lcd_panel_draw_bitmap(data_panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, buf);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Draw failed: %s", esp_err_to_name(ret));
+            break;
         }
-        free(line);
+        // Wait for transfer completion
+        if (draw_done_sem) {
+            if (xSemaphoreTake(draw_done_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGW(TAG, "Draw completion timeout");
+            }
+        }
     }
+
+    ESP_LOGI(TAG, "Cleaning up panels and DSI bus");
+    free(buf);
+    esp_lcd_panel_disp_on_off(data_panel, false);
+    esp_lcd_panel_disp_on_off(ctrl_panel, false);
+    esp_lcd_panel_del(data_panel);
+    esp_lcd_panel_del(ctrl_panel);
+    esp_lcd_panel_io_del(io_handle);
+    esp_lcd_del_dsi_bus(dsi_bus);
+    if (draw_done_sem) {
+        vSemaphoreDelete(draw_done_sem);
+        draw_done_sem = NULL;
+    }
+    panel_running = false;
+    vTaskDelete(NULL);
 }
 
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting display shell");
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ESP_ERROR_CHECK(console_cmd_init());
+    ESP_ERROR_CHECK(console_cmd_user_register("show", cmd_show));
+    ESP_ERROR_CHECK(console_cmd_user_register("set", cmd_set));
+    ESP_ERROR_CHECK(console_cmd_user_register("start", cmd_start));
+    ESP_ERROR_CHECK(console_cmd_user_register("stop", cmd_stop));
+    ESP_ERROR_CHECK(console_cmd_all_register());
+    ESP_ERROR_CHECK(console_cmd_start());
+}
