@@ -72,7 +72,7 @@ static struct {
     .vs_bp         = 40,
     .vs_fp         = 26,
     .lanes         = 2, // P4: max 2 lanes
-    .lane_rate_mbps = 1000,
+    .lane_rate_mbps = 600,
     .ldo_vci_chan   = 3,    // default VCI LDO channel
     .ldo_vci_mv     = 2700, // default analog voltage (mV)
     .ldo_iovcc_chan = 2,    // default IOVCC LDO channel
@@ -81,6 +81,26 @@ static struct {
     .disable_lp   = 0,
     .color_name    = "blue",
 };
+
+typedef struct { const char *name; uint8_t r, g, b; } color_map_t;
+static const color_map_t color_map[] = {
+    { "red",   255,   0,   0 },
+    { "green",   0, 255,   0 },
+    { "blue",    0,   0, 255 },
+    { "white", 255, 255, 255 },
+    { "black",   0,   0,   0 },
+};
+static void get_rgb_for_color(const char *name, uint8_t *r, uint8_t *g, uint8_t *b) {
+    for (size_t i = 0; i < sizeof(color_map)/sizeof(color_map[0]); ++i) {
+        if (strcmp(name, color_map[i].name) == 0) {
+            *r = color_map[i].r;
+            *g = color_map[i].g;
+            *b = color_map[i].b;
+            return;
+        }
+    }
+    *r = *g = *b = 0;
+}
 
 // LCD handles
 static esp_lcd_dsi_bus_handle_t   dsi_bus    = NULL;
@@ -170,8 +190,7 @@ static int cmd_stop(int argc, char** argv) {
 // 'start' command: re-init panel with current settings and start continuous draw loop
 static int cmd_start(int argc, char** argv) {
     if (panel_running || panel_task_handle) {
-        ESP_LOGW(TAG, "Panel task already running, restarting...");
-        cmd_stop(0, NULL); // stop if already running
+        cmd_stop(0, NULL);
     }
     BaseType_t res = xTaskCreate(
         panel_loop,
@@ -215,6 +234,13 @@ static int cmd_peek(int argc, char** argv) {
     return 0;
 }
 
+static void cleanup_panel(void) {
+    if (data_panel)  { esp_lcd_panel_del(data_panel);  data_panel  = NULL; }
+    if (ctrl_panel)  { esp_lcd_panel_del(ctrl_panel);  ctrl_panel  = NULL; }
+    if (io_handle)   { esp_lcd_panel_io_del(io_handle); io_handle   = NULL; }
+    if (dsi_bus)     { esp_lcd_del_dsi_bus(dsi_bus);    dsi_bus     = NULL; }
+}
+
 static void panel_loop(void *pvParameters) {
     esp_err_t ret = ESP_OK;
     panel_running = true;
@@ -244,11 +270,7 @@ static void panel_loop(void *pvParameters) {
     }
 
     ESP_LOGI(TAG, "Reconfiguring panel...");
-    // teardown if already running
-    if (ctrl_panel) { esp_lcd_panel_del(ctrl_panel); ctrl_panel = NULL; }
-    if (data_panel) { esp_lcd_panel_del(data_panel); data_panel = NULL; }
-    if (io_handle)  { esp_lcd_panel_io_del(io_handle); io_handle = NULL; }
-    if (dsi_bus)    { esp_lcd_del_dsi_bus(dsi_bus);     dsi_bus = NULL; }
+    cleanup_panel();
 
     // Calculate lane bit rate based on pixel clock (MHz), bits per pixel (24 for RGB888), and number of lanes
     int default_rate = panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2);
@@ -369,72 +391,50 @@ static void panel_loop(void *pvParameters) {
         ESP_ERROR_CHECK(esp_lcd_dpi_panel_register_event_callbacks(data_panel, &cbs, NULL));
     }
 
-    ESP_LOGI(TAG, "Filling screen with blue (full-frame buffer)");
-    // Allocate full-frame buffer in PSRAM (32MB available)
-    size_t total_px = panel_cfg.h_size * panel_cfg.v_size;
-    size_t buf_sz = total_px * 3; // RGB888
-    ESP_LOGI(TAG, "Allocating full-frame buffer of %u bytes", buf_sz);
-    uint8_t *buf = heap_caps_malloc(buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    s_fb_buf = buf;
-    s_fb_size = buf_sz;
-    if (!buf) {
-        ESP_LOGE(TAG, "Failed to allocate full-frame buffer: %u bytes", buf_sz);
-        return;
-    }
-    // Determine RGB values based on configured color
-    uint8_t r = 0, g = 0, b = 0;
-    if (strcmp(panel_cfg.color_name, "red") == 0) {
-        r = 255; g = 0;   b = 0;
-    } else if (strcmp(panel_cfg.color_name, "green") == 0) {
-        r = 0;   g = 255; b = 0;
-    } else if (strcmp(panel_cfg.color_name, "blue") == 0) {
-        r = 0;   g = 0;   b = 255;
-    } else if (strcmp(panel_cfg.color_name, "white") == 0) {
-        r = 255; g = 255; b = 255;
-    } else if (strcmp(panel_cfg.color_name, "black") == 0) {
-        r = 0;   g = 0;   b = 0;
-    } else {
-        ESP_LOGW(TAG, "Unknown color '%s', defaulting to blue", panel_cfg.color_name);
-        r = 0; g = 0; b = 255;
-    }
-    // Log setting pattern:
-    printf("Using color: R=%d, G=%d, B=%d\n", r, g, b);
+    // Retrieve and use the DPI driver's internal frame buffer directly
+    ESP_LOGI(TAG, "Retrieving DPI panel internal frame buffer");
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(data_panel, 1, (void**)&s_fb_buf));
+    // Compute buffer size (RGB888)
+    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3;
 
-    // Fill buffer with the selected color
-    for (size_t i = 0; i < buf_sz; i += 3) {
-        buf[i + 0] = r;
-        buf[i + 1] = g;
-        buf[i + 2] = b;
-    }
-    ESP_LOGI(TAG, "Drawing full-frame bitmap...");
+    // Determine initial RGB values based on current color setting
+    uint8_t r, g, b;
+    get_rgb_for_color(panel_cfg.color_name, &r, &g, &b);
 
-    // Continuous draw loop
+    // Fill the internal framebuffer once
+    for (size_t i = 0; i < s_fb_size; i += 3) {
+        s_fb_buf[i + 0] = r;
+        s_fb_buf[i + 1] = g;
+        s_fb_buf[i + 2] = b;
+    }
+    ESP_LOGI(TAG, "Initial internal buffer filled");
+    // Push new buffer to panel
+    ESP_LOGI(TAG, "Pushing initial buffer to panel");
+    esp_lcd_panel_draw_bitmap(data_panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, s_fb_buf);
+    if (draw_done_sem) {
+        xSemaphoreTake(draw_done_sem, portMAX_DELAY);
+    }
+
+    // Continuous update loop: only modify the buffer and delay
     while (panel_running) {
-        ret = esp_lcd_panel_draw_bitmap(data_panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, buf);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Draw failed: %s", esp_err_to_name(ret));
-            break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        // On each iteration, re-read the color setting and refill
+        get_rgb_for_color(panel_cfg.color_name, &r, &g, &b);
+
+        for (size_t i = 0; i < s_fb_size; i += 3) {
+            s_fb_buf[i + 0] = r;
+            s_fb_buf[i + 1] = g;
+            s_fb_buf[i + 2] = b;
         }
-        // Wait for transfer completion
+        // Push updated buffer to panel
+        esp_lcd_panel_draw_bitmap(data_panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, s_fb_buf);
         if (draw_done_sem) {
-            if (xSemaphoreTake(draw_done_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                ESP_LOGW(TAG, "Draw completion timeout");
-            }
+            xSemaphoreTake(draw_done_sem, portMAX_DELAY);
         }
     }
-
-    ESP_LOGI(TAG, "Cleaning up panels and DSI bus");
-    free(buf);
     //esp_lcd_panel_disp_on_off(data_panel, false);
     esp_lcd_panel_disp_on_off(ctrl_panel, false);
-    esp_lcd_panel_del(data_panel);
-    data_panel = NULL;
-    esp_lcd_panel_del(ctrl_panel);
-    ctrl_panel = NULL;
-    esp_lcd_panel_io_del(io_handle);
-    io_handle = NULL;
-    esp_lcd_del_dsi_bus(dsi_bus);
-    dsi_bus = NULL;
+    cleanup_panel();
     if (draw_done_sem) {
         vSemaphoreDelete(draw_done_sem);
         draw_done_sem = NULL;
