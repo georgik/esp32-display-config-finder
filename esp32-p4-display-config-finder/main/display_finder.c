@@ -60,6 +60,7 @@ static struct {
     int ldo_iovcc_mv;
     int use_dma2d;
     int disable_lp;
+    char color_name[8];      // default draw color: red, green, blue, white, black
 } panel_cfg = {
     .dpi_clock_mhz = 60,
     .h_size        = 800,
@@ -78,6 +79,7 @@ static struct {
     .ldo_iovcc_mv   = 1900, // default logic voltage (mV)
     .use_dma2d    = 1,
     .disable_lp   = 0,
+    .color_name    = "blue",
 };
 
 // LCD handles
@@ -85,6 +87,8 @@ static esp_lcd_dsi_bus_handle_t   dsi_bus    = NULL;
 static esp_lcd_panel_io_handle_t io_handle = NULL;
 static esp_lcd_panel_handle_t ctrl_panel = NULL;
 static esp_lcd_panel_handle_t data_panel = NULL;
+static uint8_t *s_fb_buf = NULL;
+static size_t s_fb_size = 0;
 
 // Forward declarations
 static void panel_loop(void *pvParameters);
@@ -105,6 +109,7 @@ static int cmd_show(int argc, char** argv) {
     ESP_LOGI(TAG, "  iovcc_mv=%d", panel_cfg.ldo_iovcc_mv);
     ESP_LOGI(TAG, "  use_dma2d=%d", panel_cfg.use_dma2d);
     ESP_LOGI(TAG, "  disable_lp=%d", panel_cfg.disable_lp);
+    ESP_LOGI(TAG, "  color=%s", panel_cfg.color_name);
     return 0;
 }
 
@@ -133,11 +138,21 @@ static int cmd_set(int argc, char** argv) {
     else if (strcmp(p, "iovcc_mv")==0)   panel_cfg.ldo_iovcc_mv   = v;
     else if (strcmp(p, "use_dma2d")==0)     panel_cfg.use_dma2d    = v;
     else if (strcmp(p, "disable_lp")==0)    panel_cfg.disable_lp   = v;
+    else if (strcmp(p, "color") == 0) {
+        strncpy(panel_cfg.color_name, argv[2], sizeof(panel_cfg.color_name) - 1);
+        panel_cfg.color_name[sizeof(panel_cfg.color_name) - 1] = '\0';
+    }
     else {
         printf("Unknown param '%s'\n", p);
         return 0;
     }
-    ESP_LOGI(TAG, "Set %s = %d", p, v);
+    // Special-case log for color, otherwise generic log
+    if (strcmp(p, "color") == 0) {
+        ESP_LOGI(TAG, "Set %s = %s", p, panel_cfg.color_name);
+    } else {
+        ESP_LOGI(TAG, "Set %s = %d", p, v);
+    }
+    //ESP_LOGI(TAG, "Set %s = %d", p, v); // old generic log removed/commented
     return 0;
 }
 
@@ -177,6 +192,26 @@ static int cmd_start(int argc, char** argv) {
 static int cmd_reboot(int argc, char** argv) {
     ESP_LOGI(TAG, "Rebooting system...");
     esp_restart();
+    return 0;
+}
+
+static int cmd_peek(int argc, char** argv) {
+    if (s_fb_buf == NULL) {
+        ESP_LOGW(TAG, "Framebuffer not allocated yet");
+        return 0;
+    }
+    size_t count = 16;
+    if (argc >= 2) {
+        count = atoi(argv[1]);
+    }
+    if (count > s_fb_size) {
+        count = s_fb_size;
+    }
+    printf("FB[0..%u]:", (unsigned)count);
+    for (size_t i = 0; i < count; i++) {
+        printf(" %02X", s_fb_buf[i]);
+    }
+    printf("\n");
     return 0;
 }
 
@@ -340,15 +375,36 @@ static void panel_loop(void *pvParameters) {
     size_t buf_sz = total_px * 3; // RGB888
     ESP_LOGI(TAG, "Allocating full-frame buffer of %u bytes", buf_sz);
     uint8_t *buf = heap_caps_malloc(buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    s_fb_buf = buf;
+    s_fb_size = buf_sz;
     if (!buf) {
         ESP_LOGE(TAG, "Failed to allocate full-frame buffer: %u bytes", buf_sz);
         return;
     }
-    // Fill buffer with blue pixels (R=0, G=0, B=255)
+    // Determine RGB values based on configured color
+    uint8_t r = 0, g = 0, b = 0;
+    if (strcmp(panel_cfg.color_name, "red") == 0) {
+        r = 255; g = 0;   b = 0;
+    } else if (strcmp(panel_cfg.color_name, "green") == 0) {
+        r = 0;   g = 255; b = 0;
+    } else if (strcmp(panel_cfg.color_name, "blue") == 0) {
+        r = 0;   g = 0;   b = 255;
+    } else if (strcmp(panel_cfg.color_name, "white") == 0) {
+        r = 255; g = 255; b = 255;
+    } else if (strcmp(panel_cfg.color_name, "black") == 0) {
+        r = 0;   g = 0;   b = 0;
+    } else {
+        ESP_LOGW(TAG, "Unknown color '%s', defaulting to blue", panel_cfg.color_name);
+        r = 0; g = 0; b = 255;
+    }
+    // Log setting pattern:
+    printf("Using color: R=%d, G=%d, B=%d\n", r, g, b);
+
+    // Fill buffer with the selected color
     for (size_t i = 0; i < buf_sz; i += 3) {
-        buf[i + 0] = 0xFF;
-        buf[i + 1] = 0xAA;
-        buf[i + 2] = 0xFF;
+        buf[i + 0] = r;
+        buf[i + 1] = g;
+        buf[i + 2] = b;
     }
     ESP_LOGI(TAG, "Drawing full-frame bitmap...");
 
@@ -399,6 +455,7 @@ void app_main(void)
     ESP_ERROR_CHECK(console_cmd_user_register("start", cmd_start));
     ESP_ERROR_CHECK(console_cmd_user_register("stop", cmd_stop));
     ESP_ERROR_CHECK(console_cmd_user_register("reboot", cmd_reboot));
+    ESP_ERROR_CHECK(console_cmd_user_register("peek", cmd_peek));
     ESP_ERROR_CHECK(console_cmd_all_register());
     ESP_ERROR_CHECK(console_cmd_start());
 }
