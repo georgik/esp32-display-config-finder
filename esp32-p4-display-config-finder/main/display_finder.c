@@ -27,9 +27,15 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_ldo_regulator.h"
 
+#include "driver/ledc.h"
+#include "esp_system.h"
+
 static const char *TAG = "disp_shell";
 
 static volatile bool panel_running = false;
+
+// Handle for our panel_loop task
+static TaskHandle_t panel_task_handle = NULL;
 
 static SemaphoreHandle_t draw_done_sem = NULL;
 
@@ -52,10 +58,12 @@ static struct {
     int ldo_vci_mv;
     int ldo_iovcc_chan;
     int ldo_iovcc_mv;
+    int use_dma2d;
+    int disable_lp;
 } panel_cfg = {
     .dpi_clock_mhz = 80,
-    .h_size        = 1280,
-    .v_size        = 800,
+    .h_size        = 800,
+    .v_size        = 1280,
     .hs_pw         = 16,
     .hs_bp         = 172,
     .hs_fp         = 32,
@@ -68,6 +76,8 @@ static struct {
     .ldo_vci_mv     = 2700, // default analog voltage (mV)
     .ldo_iovcc_chan = 2,    // default IOVCC LDO channel
     .ldo_iovcc_mv   = 1900, // default logic voltage (mV)
+    .use_dma2d    = 1,
+    .disable_lp   = 0,
 };
 
 // LCD handles
@@ -82,14 +92,19 @@ static void panel_loop(void *pvParameters);
 // 'show' command: display current config
 static int cmd_show(int argc, char** argv) {
     ESP_LOGI(TAG, "Panel config:");
-    ESP_LOGI(TAG, "  dpi_clock_mhz=%d", panel_cfg.dpi_clock_mhz);
-    ESP_LOGI(TAG, "  size=%dx%d", panel_cfg.h_size, panel_cfg.v_size);
-    ESP_LOGI(TAG, "  hsync pw=%d bp=%d fp=%d", panel_cfg.hs_pw, panel_cfg.hs_bp, panel_cfg.hs_fp);
-    ESP_LOGI(TAG, "  vsync pw=%d bp=%d fp=%d", panel_cfg.vs_pw, panel_cfg.vs_bp, panel_cfg.vs_fp);
+    ESP_LOGI(TAG, "  dpi=%d", panel_cfg.dpi_clock_mhz);
+    ESP_LOGI(TAG, "  hsize=%d", panel_cfg.h_size);
+    ESP_LOGI(TAG, "  vsize=%d", panel_cfg.v_size);
+    ESP_LOGI(TAG, "  hs_pw=%d hs_bp=%d hs_fp=%d", panel_cfg.hs_pw, panel_cfg.hs_bp, panel_cfg.hs_fp);
+    ESP_LOGI(TAG, "  vs_pw=%d vs_bp=%d vs_fp=%d", panel_cfg.vs_pw, panel_cfg.vs_bp, panel_cfg.vs_fp);
     ESP_LOGI(TAG, "  lanes=%d", panel_cfg.lanes);
-    ESP_LOGI(TAG, "  lane_rate_mbps=%d", panel_cfg.lane_rate_mbps ? panel_cfg.lane_rate_mbps : (panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2)));
-    ESP_LOGI(TAG, "  ldo_vci_chan=%d, ldo_vci_mv=%d", panel_cfg.ldo_vci_chan, panel_cfg.ldo_vci_mv);
-    ESP_LOGI(TAG, "  ldo_iovcc_chan=%d, ldo_iovcc_mv=%d", panel_cfg.ldo_iovcc_chan, panel_cfg.ldo_iovcc_mv);
+    ESP_LOGI(TAG, "  lane_rate=%d", panel_cfg.lane_rate_mbps ? panel_cfg.lane_rate_mbps : (panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2)));
+    ESP_LOGI(TAG, "  vci_chan=%d", panel_cfg.ldo_vci_chan);
+    ESP_LOGI(TAG, "  vci_mv=%d", panel_cfg.ldo_vci_mv);
+    ESP_LOGI(TAG, "  iovcc_chan=%d", panel_cfg.ldo_iovcc_chan);
+    ESP_LOGI(TAG, "  iovcc_mv=%d", panel_cfg.ldo_iovcc_mv);
+    ESP_LOGI(TAG, "  use_dma2d=%d", panel_cfg.use_dma2d);
+    ESP_LOGI(TAG, "  disable_lp=%d", panel_cfg.disable_lp);
     return 0;
 }
 
@@ -116,6 +131,8 @@ static int cmd_set(int argc, char** argv) {
     else if (strcmp(p, "vci_mv")==0)     panel_cfg.ldo_vci_mv     = v;
     else if (strcmp(p, "iovcc_chan")==0) panel_cfg.ldo_iovcc_chan = v;
     else if (strcmp(p, "iovcc_mv")==0)   panel_cfg.ldo_iovcc_mv   = v;
+    else if (strcmp(p, "use_dma2d")==0)     panel_cfg.use_dma2d    = v;
+    else if (strcmp(p, "disable_lp")==0)    panel_cfg.disable_lp   = v;
     else {
         printf("Unknown param '%s'\n", p);
         return 0;
@@ -124,15 +141,30 @@ static int cmd_set(int argc, char** argv) {
     return 0;
 }
 
+// 'stop' command: stop continuous draw loop
+static int cmd_stop(int argc, char** argv) {
+    panel_running = false;
+    ESP_LOGI(TAG, "Panel stop requested");
+    // Wait for the panel_loop task to exit and clear its handle
+    while (panel_task_handle) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return 0;
+}
+
 // 'start' command: re-init panel with current settings and start continuous draw loop
 static int cmd_start(int argc, char** argv) {
+    if (panel_running || panel_task_handle) {
+        ESP_LOGW(TAG, "Panel task already running, restarting...");
+        cmd_stop(0, NULL); // stop if already running
+    }
     BaseType_t res = xTaskCreate(
         panel_loop,
         "panel_loop",
         8192,
         NULL,
         tskIDLE_PRIORITY + 1,
-        NULL
+        &panel_task_handle
     );
     if (res != pdPASS) {
         ESP_LOGE(TAG, "Failed to start panel task");
@@ -140,10 +172,11 @@ static int cmd_start(int argc, char** argv) {
     return 0;
 }
 
-// 'stop' command: stop continuous draw loop
-static int cmd_stop(int argc, char** argv) {
-    panel_running = false;
-    ESP_LOGI(TAG, "Panel stop requested");
+
+// 'reboot' command: reboot the ESP chip
+static int cmd_reboot(int argc, char** argv) {
+    ESP_LOGI(TAG, "Rebooting system...");
+    esp_restart();
     return 0;
 }
 
@@ -220,6 +253,8 @@ static void panel_loop(void *pvParameters) {
         .dpi_clock_freq_mhz = panel_cfg.dpi_clock_mhz,
         .virtual_channel    = 0,
         .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
+        .in_color_format    = LCD_COLOR_FMT_RGB888,
+        .out_color_format   = LCD_COLOR_FMT_RGB888,
         .num_fbs            = 1,
         .video_timing = {
             .h_size            = panel_cfg.h_size,
@@ -231,7 +266,8 @@ static void panel_loop(void *pvParameters) {
             .vsync_back_porch  = panel_cfg.vs_bp,
             .vsync_front_porch = panel_cfg.vs_fp,
         },
-        .flags.use_dma2d   = true,
+        .flags.use_dma2d   = panel_cfg.use_dma2d,
+        .flags.disable_lp   = panel_cfg.disable_lp,
     };
 
     // Vendor config
@@ -241,7 +277,7 @@ static void panel_loop(void *pvParameters) {
 
     // Install control panel driver
     esp_lcd_panel_dev_config_t ctrl_cfg = {
-        .reset_gpio_num = BSP_LCD_RST,
+        .reset_gpio_num = GPIO_NUM_NC, // no reset GPIO
         .rgb_ele_order  = BSP_LCD_COLOR_SPACE,
         .bits_per_pixel = 24,
         .vendor_config  = &vendor_cfg,  // reuse vendor_cfg
@@ -328,14 +364,19 @@ static void panel_loop(void *pvParameters) {
     esp_lcd_panel_disp_on_off(data_panel, false);
     esp_lcd_panel_disp_on_off(ctrl_panel, false);
     esp_lcd_panel_del(data_panel);
+    data_panel = NULL;
     esp_lcd_panel_del(ctrl_panel);
+    ctrl_panel = NULL;
     esp_lcd_panel_io_del(io_handle);
+    io_handle = NULL;
     esp_lcd_del_dsi_bus(dsi_bus);
+    dsi_bus = NULL;
     if (draw_done_sem) {
         vSemaphoreDelete(draw_done_sem);
         draw_done_sem = NULL;
     }
     panel_running = false;
+    panel_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -349,6 +390,7 @@ void app_main(void)
     ESP_ERROR_CHECK(console_cmd_user_register("set", cmd_set));
     ESP_ERROR_CHECK(console_cmd_user_register("start", cmd_start));
     ESP_ERROR_CHECK(console_cmd_user_register("stop", cmd_stop));
+    ESP_ERROR_CHECK(console_cmd_user_register("reboot", cmd_reboot));
     ESP_ERROR_CHECK(console_cmd_all_register());
     ESP_ERROR_CHECK(console_cmd_start());
 }
