@@ -61,7 +61,7 @@ static struct {
     int use_dma2d;
     int disable_lp;
 } panel_cfg = {
-    .dpi_clock_mhz = 80,
+    .dpi_clock_mhz = 60,
     .h_size        = 800,
     .v_size        = 1280,
     .hs_pw         = 16,
@@ -71,7 +71,7 @@ static struct {
     .vs_bp         = 40,
     .vs_fp         = 26,
     .lanes         = 2, // P4: max 2 lanes
-    .lane_rate_mbps = 0,
+    .lane_rate_mbps = 1000,
     .ldo_vci_chan   = 3,    // default VCI LDO channel
     .ldo_vci_mv     = 2700, // default analog voltage (mV)
     .ldo_iovcc_chan = 2,    // default IOVCC LDO channel
@@ -98,7 +98,7 @@ static int cmd_show(int argc, char** argv) {
     ESP_LOGI(TAG, "  hs_pw=%d hs_bp=%d hs_fp=%d", panel_cfg.hs_pw, panel_cfg.hs_bp, panel_cfg.hs_fp);
     ESP_LOGI(TAG, "  vs_pw=%d vs_bp=%d vs_fp=%d", panel_cfg.vs_pw, panel_cfg.vs_bp, panel_cfg.vs_fp);
     ESP_LOGI(TAG, "  lanes=%d", panel_cfg.lanes);
-    ESP_LOGI(TAG, "  lane_rate=%d", panel_cfg.lane_rate_mbps ? panel_cfg.lane_rate_mbps : (panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2)));
+    ESP_LOGI(TAG, "  lane_rate=%d", panel_cfg.lane_rate_mbps);
     ESP_LOGI(TAG, "  vci_chan=%d", panel_cfg.ldo_vci_chan);
     ESP_LOGI(TAG, "  vci_mv=%d", panel_cfg.ldo_vci_mv);
     ESP_LOGI(TAG, "  iovcc_chan=%d", panel_cfg.ldo_iovcc_chan);
@@ -314,6 +314,14 @@ static void panel_loop(void *pvParameters) {
         ESP_LOGE(TAG, "DPI init failed: %s", esp_err_to_name(ret));
         return;
     }
+    ESP_LOGI(TAG, "Turning on data panel display...");
+    ret = esp_lcd_panel_disp_on_off(data_panel, true);
+    if (ret == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "DPI panel disp_on_off not supported; continuing without explicit display-on call");
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DPI display on failed: %s", esp_err_to_name(ret));
+        // don't abort the task; just log and continue
+    }
 
     // Create binary semaphore for draw completion
     draw_done_sem = xSemaphoreCreateBinary();
@@ -361,7 +369,7 @@ static void panel_loop(void *pvParameters) {
 
     ESP_LOGI(TAG, "Cleaning up panels and DSI bus");
     free(buf);
-    esp_lcd_panel_disp_on_off(data_panel, false);
+    //esp_lcd_panel_disp_on_off(data_panel, false);
     esp_lcd_panel_disp_on_off(ctrl_panel, false);
     esp_lcd_panel_del(data_panel);
     data_panel = NULL;
