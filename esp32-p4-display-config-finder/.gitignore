@@ -1,0 +1,118 @@
+# ESP-IDF Build System
+build/
+build_*
+.pio/
+.vscode/
+.idea/
+
+# ESP-IDF specific
+sdkconfig.old
+sdkconfig.backup
+dependencies.lock
+managed_components/
+
+# Python virtual environment
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Component manager
+.component_manager_cache/
+component_dependencies.lock
+
+# Build artifacts
+*.bin
+*.elf
+*.map
+*.hex
+*.out
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Debug files
+*.dSYM/
+*.debug
+*.gdb_history
+
+# Log files
+*.log
+*.txt
+flash_*_args
+
+# Temporary files
+*~
+*.swp
+*.swo
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-*
+*.code-workspace
+
+# Documentation build
+docs/_build/
+docs/doxygen-warning-log.txt
+docs/sphinx-warning-log.txt
+
+# Coverage reports
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# Test outputs
+test_results/
+test_*.xml
+
+# Local configuration
+local.properties
+config.local
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# Bootloader and partition table artifacts
+bootloader/
+partition_table/
+
+# ESP-IDF tools
+tools/
+
+# Generated files
+version.txt
+flash_project_args
+
+# Backup files
+*.bak
+*.backup
+
+# Lock files
+*.lock
+
+# Flash args
+flash_args
+
+# Monitor logs
+monitor.log
+
+# ESP32 specific
+esp32.svd
+esp32s2.svd
+esp32s3.svd
+esp32c3.svd
+esp32p4.svd
