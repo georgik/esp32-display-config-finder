@@ -20,6 +20,7 @@
 #include "esp_lcd_panel_commands.h"
 #include "esp_lcd_panel_interface.h"
 #include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_ili9881c.h"
 #include "sdkconfig.h"
@@ -72,13 +73,13 @@ static struct {
     .vs_bp         = 40,
     .vs_fp         = 26,
     .lanes         = 2, // P4: max 2 lanes
-    .lane_rate_mbps = 600,
+    .lane_rate_mbps = 520,
     .ldo_vci_chan   = 3,    // default VCI LDO channel
     .ldo_vci_mv     = 2700, // default analog voltage (mV)
     .ldo_iovcc_chan = 2,    // default IOVCC LDO channel
     .ldo_iovcc_mv   = 1900, // default logic voltage (mV)
     .use_dma2d    = 1,
-    .disable_lp   = 0,
+    .disable_lp   = 1,
     .color_name    = "blue",
 };
 
@@ -91,6 +92,7 @@ static const color_map_t color_map[] = {
     { "black",   0,   0,   0 },
 };
 static void get_rgb_for_color(const char *name, uint8_t *r, uint8_t *g, uint8_t *b) {
+
     for (size_t i = 0; i < sizeof(color_map)/sizeof(color_map[0]); ++i) {
         if (strcmp(name, color_map[i].name) == 0) {
             *r = color_map[i].r;
@@ -334,7 +336,7 @@ static void panel_loop(void *pvParameters) {
 
     // Install control panel driver
     esp_lcd_panel_dev_config_t ctrl_cfg = {
-        .reset_gpio_num = GPIO_NUM_NC, // no reset GPIO
+        .reset_gpio_num = GPIO_NUM_27, // no reset GPIO
         .rgb_ele_order  = BSP_LCD_COLOR_SPACE,
         .bits_per_pixel = 24,
         .vendor_config  = &vendor_cfg,  // reuse vendor_cfg
@@ -391,11 +393,15 @@ static void panel_loop(void *pvParameters) {
         ESP_ERROR_CHECK(esp_lcd_dpi_panel_register_event_callbacks(data_panel, &cbs, NULL));
     }
 
-    // Retrieve and use the DPI driver's internal frame buffer directly
-    ESP_LOGI(TAG, "Retrieving DPI panel internal frame buffer");
-    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(data_panel, 1, (void**)&s_fb_buf));
-    // Compute buffer size (RGB888)
-    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3;
+    // Allocate our own DMA-capable frame buffer for full-screen RGB888
+    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3; // 3 bytes per pixel
+    ESP_LOGI(TAG, "Allocating framebuffer of size %u bytes", (unsigned)s_fb_size);
+    s_fb_buf = heap_caps_malloc(s_fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!s_fb_buf) {
+        ESP_LOGE(TAG, "Failed to allocate framebuffer");
+        cleanup_panel();
+        return;
+    }
 
     // Determine initial RGB values based on current color setting
     uint8_t r, g, b;
@@ -403,9 +409,9 @@ static void panel_loop(void *pvParameters) {
 
     // Fill the internal framebuffer once
     for (size_t i = 0; i < s_fb_size; i += 3) {
-        s_fb_buf[i + 0] = r;
+        s_fb_buf[i + 0] = b;
         s_fb_buf[i + 1] = g;
-        s_fb_buf[i + 2] = b;
+        s_fb_buf[i + 2] = r;
     }
     ESP_LOGI(TAG, "Initial internal buffer filled");
     // Push new buffer to panel
@@ -422,9 +428,9 @@ static void panel_loop(void *pvParameters) {
         get_rgb_for_color(panel_cfg.color_name, &r, &g, &b);
 
         for (size_t i = 0; i < s_fb_size; i += 3) {
-            s_fb_buf[i + 0] = r;
+            s_fb_buf[i + 0] = b;
             s_fb_buf[i + 1] = g;
-            s_fb_buf[i + 2] = b;
+            s_fb_buf[i + 2] = r;
         }
         // Push updated buffer to panel
         esp_lcd_panel_draw_bitmap(data_panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, s_fb_buf);
@@ -434,6 +440,10 @@ static void panel_loop(void *pvParameters) {
     }
     //esp_lcd_panel_disp_on_off(data_panel, false);
     esp_lcd_panel_disp_on_off(ctrl_panel, false);
+    if (s_fb_buf) {
+        heap_caps_free(s_fb_buf);
+        s_fb_buf = NULL;
+    }
     cleanup_panel();
     if (draw_done_sem) {
         vSemaphoreDelete(draw_done_sem);
