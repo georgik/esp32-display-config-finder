@@ -406,21 +406,54 @@ static int cmd_oneframe(int argc, char** argv) {
     ESP_LOGI(TAG, "Single frame color: %s (R:%d, G:%d, B:%d)", panel_cfg.color_name, r, g, b);
 
     // Fill the internal framebuffer with the selected color
+    ESP_LOGI(TAG, "Framebuffer info: addr=%p, size=%zu, bits_per_pixel=%d", s_fb_buf, s_fb_size, panel_cfg.bits_per_pixel);
+    
     if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
         // RGB565: 16-bit pixels (2 bytes per pixel)
+        // Format: RRRR RGGG GGGB BBBB
+        // Try different byte order approach - some panels expect little-endian
         uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+        ESP_LOGI(TAG, "RGB565 conversion: RGB(%d,%d,%d) -> 0x%04X", r, g, b, rgb565);
+        
+        // Test both 16-bit and byte-wise filling to see which works
         uint16_t *fb_16 = (uint16_t*)s_fb_buf;
         size_t pixel_count = s_fb_size / 2;
-        for (size_t i = 0; i < pixel_count; i++) {
+        ESP_LOGI(TAG, "Filling %zu pixels with RGB565 value 0x%04X", pixel_count, rgb565);
+        
+        // Fill first few pixels for testing
+        for (size_t i = 0; i < pixel_count && i < 10; i++) {
             fb_16[i] = rgb565;
         }
+        
+        // Also try byte-wise filling to test byte order
+        uint8_t high_byte = (rgb565 >> 8) & 0xFF;
+        uint8_t low_byte = rgb565 & 0xFF;
+        ESP_LOGI(TAG, "RGB565 bytes: high=0x%02X, low=0x%02X", high_byte, low_byte);
+        
+        // Fill the rest with consistent approach
+        for (size_t i = 10; i < pixel_count; i++) {
+            fb_16[i] = rgb565;
+        }
+        
+        // Verify what we actually wrote
+        ESP_LOGI(TAG, "Verification - First 4 RGB565 pixels as uint16: 0x%04X 0x%04X 0x%04X 0x%04X", 
+                 fb_16[0], fb_16[1], fb_16[2], fb_16[3]);
+        ESP_LOGI(TAG, "Verification - First 8 bytes as uint8: %02X %02X %02X %02X %02X %02X %02X %02X", 
+                 s_fb_buf[0], s_fb_buf[1], s_fb_buf[2], s_fb_buf[3], 
+                 s_fb_buf[4], s_fb_buf[5], s_fb_buf[6], s_fb_buf[7]);
     } else {
         // RGB888: 24-bit pixels (3 bytes per pixel)
+        ESP_LOGI(TAG, "RGB888 conversion: RGB(%d,%d,%d)", r, g, b);
+        ESP_LOGI(TAG, "Filling %zu bytes with RGB888 pattern [B,G,R]", s_fb_size);
         for (size_t i = 0; i < s_fb_size; i += 3) {
             s_fb_buf[i + 0] = b;  // Blue component
             s_fb_buf[i + 1] = g;  // Green component
             s_fb_buf[i + 2] = r;  // Red component
         }
+        // Verify first few pixels
+        ESP_LOGI(TAG, "Verification - First 4 RGB888 pixels: [%02X,%02X,%02X] [%02X,%02X,%02X] [%02X,%02X,%02X] [%02X,%02X,%02X]", 
+                 s_fb_buf[0], s_fb_buf[1], s_fb_buf[2], s_fb_buf[3], s_fb_buf[4], s_fb_buf[5],
+                 s_fb_buf[6], s_fb_buf[7], s_fb_buf[8], s_fb_buf[9], s_fb_buf[10], s_fb_buf[11]);
     }
     ESP_LOGI(TAG, "Frame buffer filled with color");
     
