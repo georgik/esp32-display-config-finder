@@ -63,6 +63,8 @@ static struct {
     int use_dma2d;
     int disable_lp;
     char color_name[8];      // default draw color: red, green, blue, white, black
+    char pixel_format[8];    // pixel format: RGB888 or RGB565
+    int bits_per_pixel;      // calculated based on pixel format
 } panel_cfg = {
     .dpi_clock_mhz = 60,
     .h_size        = 800,
@@ -82,6 +84,8 @@ static struct {
     .use_dma2d    = 1,
     .disable_lp   = 1,
     .color_name    = "blue",
+    .pixel_format  = "RGB888",
+    .bits_per_pixel = 24,
 };
 
 typedef struct { const char *name; uint8_t r, g, b; } color_map_t;
@@ -117,6 +121,7 @@ static size_t s_fb_size = 0;
 static void panel_loop(void *pvParameters);
 static void cleanup_panel(void);
 static int cmd_sweep(int argc, char** argv);
+static int cmd_multisweep(int argc, char** argv);
 static int cmd_autotest(int argc, char** argv);
 static int cmd_diagnose(int argc, char** argv);
 
@@ -137,6 +142,8 @@ static int cmd_show(int argc, char** argv) {
     ESP_LOGI(TAG, "  use_dma2d=%d", panel_cfg.use_dma2d);
     ESP_LOGI(TAG, "  disable_lp=%d", panel_cfg.disable_lp);
     ESP_LOGI(TAG, "  color=%s", panel_cfg.color_name);
+    ESP_LOGI(TAG, "  pixel_format=%s", panel_cfg.pixel_format);
+    ESP_LOGI(TAG, "  bits_per_pixel=%d", panel_cfg.bits_per_pixel);
     return 0;
 }
 
@@ -169,13 +176,29 @@ static int cmd_set(int argc, char** argv) {
         strncpy(panel_cfg.color_name, argv[2], sizeof(panel_cfg.color_name) - 1);
         panel_cfg.color_name[sizeof(panel_cfg.color_name) - 1] = '\0';
     }
+    else if (strcmp(p, "pixel_format") == 0) {
+        const char *fmt = argv[2];
+        if (strcmp(fmt, "RGB888") == 0) {
+            strncpy(panel_cfg.pixel_format, "RGB888", sizeof(panel_cfg.pixel_format) - 1);
+            panel_cfg.bits_per_pixel = 24;
+        } else if (strcmp(fmt, "RGB565") == 0) {
+            strncpy(panel_cfg.pixel_format, "RGB565", sizeof(panel_cfg.pixel_format) - 1);
+            panel_cfg.bits_per_pixel = 16;
+        } else {
+            printf("Invalid pixel format '%s'. Use RGB888 or RGB565\n", fmt);
+            return 0;
+        }
+        panel_cfg.pixel_format[sizeof(panel_cfg.pixel_format) - 1] = '\0';
+    }
     else {
         printf("Unknown param '%s'\n", p);
         return 0;
     }
-    // Special-case log for color, otherwise generic log
+    // Special-case log for string parameters
     if (strcmp(p, "color") == 0) {
         ESP_LOGI(TAG, "Set %s = %s", p, panel_cfg.color_name);
+    } else if (strcmp(p, "pixel_format") == 0) {
+        ESP_LOGI(TAG, "Set %s = %s (%d bpp)", p, panel_cfg.pixel_format, panel_cfg.bits_per_pixel);
     } else {
         ESP_LOGI(TAG, "Set %s = %d", p, v);
     }
@@ -231,10 +254,10 @@ static int cmd_oneframe(int argc, char** argv) {
     ESP_LOGI(TAG, "Reconfiguring panel...");
     cleanup_panel();
 
-    // Calculate lane bit rate based on pixel clock (MHz), bits per pixel (24 for RGB888), and number of lanes
-    int default_rate = panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2);
+    // Calculate lane bit rate based on pixel clock (MHz), bits per pixel (dynamic), and number of lanes
+    int default_rate = panel_cfg.dpi_clock_mhz * panel_cfg.bits_per_pixel / (panel_cfg.lanes * 2);
     int lane_rate_mbps = panel_cfg.lane_rate_mbps > 0 ? panel_cfg.lane_rate_mbps : default_rate;
-    ESP_LOGI(TAG, "DSI lane bit rate: %d Mbps (default %d)", lane_rate_mbps, default_rate);
+    ESP_LOGI(TAG, "DSI lane bit rate: %d Mbps (default %d, %d bpp)", lane_rate_mbps, default_rate, panel_cfg.bits_per_pixel);
 
     // 1) DSI bus
     esp_lcd_dsi_bus_config_t bus_cfg = {
@@ -263,14 +286,26 @@ static int cmd_oneframe(int argc, char** argv) {
     }
     ESP_LOGI(TAG, "DBI IO created");
 
+    // Set pixel format based on configuration
+    lcd_color_rgb_pixel_format_t pixel_format;
+    lcd_color_format_t color_format;
+    
+    if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
+        pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
+        color_format = LCD_COLOR_FMT_RGB565;
+    } else { // Default to RGB888
+        pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB888;
+        color_format = LCD_COLOR_FMT_RGB888;
+    }
+    
     // DPI timing
     esp_lcd_dpi_panel_config_t dpi_cfg = {
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = panel_cfg.dpi_clock_mhz,
         .virtual_channel    = 0,
-        .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
-        .in_color_format    = LCD_COLOR_FMT_RGB888,
-        .out_color_format   = LCD_COLOR_FMT_RGB888,
+        .pixel_format       = pixel_format,
+        .in_color_format    = color_format,
+        .out_color_format   = color_format,
         .num_fbs            = 1,
         .video_timing = {
             .h_size            = panel_cfg.h_size,
@@ -297,7 +332,7 @@ static int cmd_oneframe(int argc, char** argv) {
     esp_lcd_panel_dev_config_t ctrl_cfg = {
         .reset_gpio_num = GPIO_NUM_27, // no reset GPIO
         .rgb_ele_order  = BSP_LCD_COLOR_SPACE,
-        .bits_per_pixel = 24,
+        .bits_per_pixel = panel_cfg.bits_per_pixel,
         .vendor_config  = &vendor_cfg,  // reuse vendor_cfg
     };
     ESP_LOGI(TAG, "Creating ILI9881C control panel...");
@@ -361,8 +396,9 @@ static int cmd_oneframe(int argc, char** argv) {
         return 1;
     }
     s_fb_buf = (uint8_t*)fb_ptr;
-    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3; // 3 bytes per pixel
-    ESP_LOGI(TAG, "Using DPI internal frame buffer at %p, size %u bytes", s_fb_buf, (unsigned)s_fb_size);
+    int bytes_per_pixel = panel_cfg.bits_per_pixel / 8;
+    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * bytes_per_pixel;
+    ESP_LOGI(TAG, "Using DPI internal frame buffer at %p, size %u bytes (%d bytes/pixel)", s_fb_buf, (unsigned)s_fb_size, bytes_per_pixel);
 
     // Determine RGB values based on current color setting
     uint8_t r, g, b;
@@ -370,10 +406,21 @@ static int cmd_oneframe(int argc, char** argv) {
     ESP_LOGI(TAG, "Single frame color: %s (R:%d, G:%d, B:%d)", panel_cfg.color_name, r, g, b);
 
     // Fill the internal framebuffer with the selected color
-    for (size_t i = 0; i < s_fb_size; i += 3) {
-        s_fb_buf[i + 0] = b;  // Blue component
-        s_fb_buf[i + 1] = g;  // Green component
-        s_fb_buf[i + 2] = r;  // Red component
+    if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
+        // RGB565: 16-bit pixels (2 bytes per pixel)
+        uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+        uint16_t *fb_16 = (uint16_t*)s_fb_buf;
+        size_t pixel_count = s_fb_size / 2;
+        for (size_t i = 0; i < pixel_count; i++) {
+            fb_16[i] = rgb565;
+        }
+    } else {
+        // RGB888: 24-bit pixels (3 bytes per pixel)
+        for (size_t i = 0; i < s_fb_size; i += 3) {
+            s_fb_buf[i + 0] = b;  // Blue component
+            s_fb_buf[i + 1] = g;  // Green component
+            s_fb_buf[i + 2] = r;  // Red component
+        }
     }
     ESP_LOGI(TAG, "Frame buffer filled with color");
     
@@ -449,9 +496,10 @@ static int cmd_diagnose(int argc, char** argv) {
     
     // 1. Basic framebuffer info
     ESP_LOGI(TAG, "Framebuffer address: %p", s_fb_buf);
-    ESP_LOGI(TAG, "Framebuffer size: %u bytes (%dx%d x 3 bytes/pixel)", 
-             (unsigned)s_fb_size, panel_cfg.h_size, panel_cfg.v_size);
-    ESP_LOGI(TAG, "Expected size: %u bytes", (unsigned)(panel_cfg.h_size * panel_cfg.v_size * 3));
+    int bytes_per_pixel = panel_cfg.bits_per_pixel / 8;
+    ESP_LOGI(TAG, "Framebuffer size: %u bytes (%dx%d x %d bytes/pixel)", 
+             (unsigned)s_fb_size, panel_cfg.h_size, panel_cfg.v_size, bytes_per_pixel);
+    ESP_LOGI(TAG, "Expected size: %u bytes", (unsigned)(panel_cfg.h_size * panel_cfg.v_size * bytes_per_pixel));
     
     // 2. Memory alignment check
     uintptr_t fb_addr = (uintptr_t)s_fb_buf;
@@ -485,11 +533,24 @@ static int cmd_diagnose(int argc, char** argv) {
     for (int y = 0; y < panel_cfg.v_size; y++) {
         int stripe = (y / 32) % 4; // 32-pixel high stripes
         for (int x = 0; x < panel_cfg.h_size; x++) {
-            size_t idx = (y * panel_cfg.h_size + x) * 3;
-            if (idx + 2 < s_fb_size) {
-                s_fb_buf[idx + 0] = pattern_colors[stripe][2]; // B
-                s_fb_buf[idx + 1] = pattern_colors[stripe][1]; // G  
-                s_fb_buf[idx + 2] = pattern_colors[stripe][0]; // R
+            size_t idx = (y * panel_cfg.h_size + x) * bytes_per_pixel;
+            if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
+                // RGB565: 16-bit pixels
+                if (idx + 1 < s_fb_size) {
+                    uint8_t r = pattern_colors[stripe][0];
+                    uint8_t g = pattern_colors[stripe][1];
+                    uint8_t b = pattern_colors[stripe][2];
+                    uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+                    uint16_t *fb_16 = (uint16_t*)s_fb_buf;
+                    fb_16[idx/2] = rgb565;
+                }
+            } else {
+                // RGB888: 24-bit pixels
+                if (idx + 2 < s_fb_size) {
+                    s_fb_buf[idx + 0] = pattern_colors[stripe][2]; // B
+                    s_fb_buf[idx + 1] = pattern_colors[stripe][1]; // G  
+                    s_fb_buf[idx + 2] = pattern_colors[stripe][0]; // R
+                }
             }
         }
     }
@@ -543,17 +604,38 @@ static int cmd_diagnose(int argc, char** argv) {
     for (int y = 0; y < 128 && y < panel_cfg.v_size; y += 32) {
         int expected_stripe = (y / 32) % 4;
         for (int x = 0; x < 10 && x < panel_cfg.h_size; x++) {
-            size_t idx = (y * panel_cfg.h_size + x) * 3;
-            if (idx + 2 < s_fb_size) {
-                if (s_fb_buf[idx + 0] != pattern_colors[expected_stripe][2] ||
-                    s_fb_buf[idx + 1] != pattern_colors[expected_stripe][1] ||
-                    s_fb_buf[idx + 2] != pattern_colors[expected_stripe][0]) {
-                    error_count++;
-                    pattern_ok = false;
-                    if (error_count <= 3) { // Limit error spam
-                        ESP_LOGW(TAG, "Pattern mismatch at (%d,%d): got [%02X,%02X,%02X], expected [%02X,%02X,%02X]",
-                                x, y, s_fb_buf[idx+0], s_fb_buf[idx+1], s_fb_buf[idx+2],
-                                pattern_colors[expected_stripe][2], pattern_colors[expected_stripe][1], pattern_colors[expected_stripe][0]);
+            size_t idx = (y * panel_cfg.h_size + x) * bytes_per_pixel;
+            if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
+                // RGB565: check 16-bit values
+                if (idx + 1 < s_fb_size) {
+                    uint16_t *fb_16 = (uint16_t*)s_fb_buf;
+                    uint16_t pixel = fb_16[idx/2];
+                    uint8_t r = pattern_colors[expected_stripe][0];
+                    uint8_t g = pattern_colors[expected_stripe][1];
+                    uint8_t b = pattern_colors[expected_stripe][2];
+                    uint16_t expected = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+                    if (pixel != expected) {
+                        error_count++;
+                        pattern_ok = false;
+                        if (error_count <= 3) {
+                            ESP_LOGW(TAG, "Pattern mismatch at (%d,%d): got 0x%04X, expected 0x%04X",
+                                    x, y, pixel, expected);
+                        }
+                    }
+                }
+            } else {
+                // RGB888: check 24-bit values
+                if (idx + 2 < s_fb_size) {
+                    if (s_fb_buf[idx + 0] != pattern_colors[expected_stripe][2] ||
+                        s_fb_buf[idx + 1] != pattern_colors[expected_stripe][1] ||
+                        s_fb_buf[idx + 2] != pattern_colors[expected_stripe][0]) {
+                        error_count++;
+                        pattern_ok = false;
+                        if (error_count <= 3) { // Limit error spam
+                            ESP_LOGW(TAG, "Pattern mismatch at (%d,%d): got [%02X,%02X,%02X], expected [%02X,%02X,%02X]",
+                                    x, y, s_fb_buf[idx+0], s_fb_buf[idx+1], s_fb_buf[idx+2],
+                                    pattern_colors[expected_stripe][2], pattern_colors[expected_stripe][1], pattern_colors[expected_stripe][0]);
+                        }
                     }
                 }
             }
@@ -569,7 +651,7 @@ static int cmd_diagnose(int argc, char** argv) {
     // 7. MIPI DSI lane utilization check
     ESP_LOGI(TAG, "\n=== MIPI DSI UTILIZATION ANALYSIS ===");
     int total_pixels = panel_cfg.h_size * panel_cfg.v_size;
-    int total_bits = total_pixels * 24; // RGB888
+    int total_bits = total_pixels * panel_cfg.bits_per_pixel;
     int refresh_rate_target = 60; // Hz
     int required_bandwidth_mbps = (total_bits * refresh_rate_target) / 1000000;
     
@@ -642,10 +724,10 @@ static void panel_loop(void *pvParameters) {
     ESP_LOGI(TAG, "Reconfiguring panel...");
     cleanup_panel();
 
-    // Calculate lane bit rate based on pixel clock (MHz), bits per pixel (24 for RGB888), and number of lanes
-    int default_rate = panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2);
+    // Calculate lane bit rate based on pixel clock (MHz), bits per pixel (dynamic), and number of lanes
+    int default_rate = panel_cfg.dpi_clock_mhz * panel_cfg.bits_per_pixel / (panel_cfg.lanes * 2);
     int lane_rate_mbps = panel_cfg.lane_rate_mbps > 0 ? panel_cfg.lane_rate_mbps : default_rate;
-    ESP_LOGI(TAG, "DSI lane bit rate: %d Mbps (default %d)", lane_rate_mbps, default_rate);
+    ESP_LOGI(TAG, "DSI lane bit rate: %d Mbps (default %d, %d bpp)", lane_rate_mbps, default_rate, panel_cfg.bits_per_pixel);
 
     // 1) DSI bus
     esp_lcd_dsi_bus_config_t bus_cfg = {
@@ -674,14 +756,26 @@ static void panel_loop(void *pvParameters) {
     }
     ESP_LOGI(TAG, "DBI IO created");
 
+    // Set pixel format based on configuration
+    lcd_color_rgb_pixel_format_t pixel_format;
+    lcd_color_format_t color_format;
+    
+    if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
+        pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
+        color_format = LCD_COLOR_FMT_RGB565;
+    } else { // Default to RGB888
+        pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB888;
+        color_format = LCD_COLOR_FMT_RGB888;
+    }
+    
     // DPI timing
     esp_lcd_dpi_panel_config_t dpi_cfg = {
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = panel_cfg.dpi_clock_mhz,
         .virtual_channel    = 0,
-        .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
-        .in_color_format    = LCD_COLOR_FMT_RGB888,
-        .out_color_format   = LCD_COLOR_FMT_RGB888,
+        .pixel_format       = pixel_format,
+        .in_color_format    = color_format,
+        .out_color_format   = color_format,
         .num_fbs            = 1,
         .video_timing = {
             .h_size            = panel_cfg.h_size,
@@ -708,7 +802,7 @@ static void panel_loop(void *pvParameters) {
     esp_lcd_panel_dev_config_t ctrl_cfg = {
         .reset_gpio_num = GPIO_NUM_27, // no reset GPIO
         .rgb_ele_order  = BSP_LCD_COLOR_SPACE,
-        .bits_per_pixel = 24,
+        .bits_per_pixel = panel_cfg.bits_per_pixel,
         .vendor_config  = &vendor_cfg,  // reuse vendor_cfg
     };
     ESP_LOGI(TAG, "Creating ILI9881C control panel...");
@@ -773,18 +867,30 @@ static void panel_loop(void *pvParameters) {
         return;
     }
     s_fb_buf = (uint8_t*)fb_ptr;
-    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3; // 3 bytes per pixel
-    ESP_LOGI(TAG, "Using DPI internal frame buffer at %p, size %u bytes", s_fb_buf, (unsigned)s_fb_size);
+    int bytes_per_pixel = panel_cfg.bits_per_pixel / 8;
+    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * bytes_per_pixel;
+    ESP_LOGI(TAG, "Using DPI internal frame buffer at %p, size %u bytes (%d bytes/pixel)", s_fb_buf, (unsigned)s_fb_size, bytes_per_pixel);
 
     // Determine initial RGB values based on current color setting
     uint8_t r, g, b;
     get_rgb_for_color(panel_cfg.color_name, &r, &g, &b);
 
     // Fill the internal framebuffer once
-    for (size_t i = 0; i < s_fb_size; i += 3) {
-        s_fb_buf[i + 0] = b;
-        s_fb_buf[i + 1] = g;
-        s_fb_buf[i + 2] = r;
+    if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
+        // RGB565: 16-bit pixels (2 bytes per pixel)
+        uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+        uint16_t *fb_16 = (uint16_t*)s_fb_buf;
+        size_t pixel_count = s_fb_size / 2;
+        for (size_t i = 0; i < pixel_count; i++) {
+            fb_16[i] = rgb565;
+        }
+    } else {
+        // RGB888: 24-bit pixels (3 bytes per pixel)
+        for (size_t i = 0; i < s_fb_size; i += 3) {
+            s_fb_buf[i + 0] = b;
+            s_fb_buf[i + 1] = g;
+            s_fb_buf[i + 2] = r;
+        }
     }
     ESP_LOGI(TAG, "Initial internal buffer filled");
     // Push new buffer to panel
@@ -808,10 +914,21 @@ static void panel_loop(void *pvParameters) {
         ESP_LOGI(TAG, "Displaying color: %s (R:%d, G:%d, B:%d)", current_color, r, g, b);
         
         // Fill buffer with current color
-        for (size_t i = 0; i < s_fb_size; i += 3) {
-            s_fb_buf[i + 0] = b;  // Blue component
-            s_fb_buf[i + 1] = g;  // Green component  
-            s_fb_buf[i + 2] = r;  // Red component
+        if (strcmp(panel_cfg.pixel_format, "RGB565") == 0) {
+            // RGB565: 16-bit pixels (2 bytes per pixel)
+            uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+            uint16_t *fb_16 = (uint16_t*)s_fb_buf;
+            size_t pixel_count = s_fb_size / 2;
+            for (size_t i = 0; i < pixel_count; i++) {
+                fb_16[i] = rgb565;
+            }
+        } else {
+            // RGB888: 24-bit pixels (3 bytes per pixel)
+            for (size_t i = 0; i < s_fb_size; i += 3) {
+                s_fb_buf[i + 0] = b;  // Blue component
+                s_fb_buf[i + 1] = g;  // Green component  
+                s_fb_buf[i + 2] = r;  // Red component
+            }
         }
         
         // Push updated buffer to panel
@@ -860,6 +977,9 @@ static int cmd_sweep(int argc, char** argv) {
     
     // Store original value to restore later
     int original_value = 0;
+    char original_str_value[16] = "";
+    bool is_string_param = false;
+    
     if      (strcmp(param, "dpi") == 0) original_value = panel_cfg.dpi_clock_mhz;
     else if (strcmp(param, "hs_pw") == 0) original_value = panel_cfg.hs_pw;
     else if (strcmp(param, "hs_bp") == 0) original_value = panel_cfg.hs_bp;
@@ -868,35 +988,67 @@ static int cmd_sweep(int argc, char** argv) {
     else if (strcmp(param, "vs_bp") == 0) original_value = panel_cfg.vs_bp;
     else if (strcmp(param, "vs_fp") == 0) original_value = panel_cfg.vs_fp;
     else if (strcmp(param, "lane_rate") == 0) original_value = panel_cfg.lane_rate_mbps;
+    else if (strcmp(param, "pixel_format") == 0) {
+        strncpy(original_str_value, panel_cfg.pixel_format, sizeof(original_str_value) - 1);
+        is_string_param = true;
+    }
     else {
         printf("Unsupported parameter for sweep: %s\n", param);
         return 0;
     }
     
-    for (int value = start; value <= end; value += step) {
-        ESP_LOGI(TAG, "\n=== SWEEP: %s = %d ===", param, value);
+    // Special handling for pixel_format parameter
+    if (strcmp(param, "pixel_format") == 0) {
+        const char* formats[] = {"RGB888", "RGB565"};
+        int num_formats = 2;
         
-        // Set the parameter
-        char val_str[16];
-        snprintf(val_str, sizeof(val_str), "%d", value);
-        char *set_argv[] = {"set", (char*)param, val_str};
-        cmd_set(3, set_argv);
-        
-        // Display one frame
-        ESP_LOGI(TAG, "Testing %s=%d...", param, value);
-        cmd_oneframe(0, NULL);
-        
-        // Wait for user observation
-        ESP_LOGI(TAG, "Displaying for %dms - observe the result", delay_ms);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        for (int i = 0; i < num_formats; i++) {
+            ESP_LOGI(TAG, "\n=== SWEEP: %s = %s ===", param, formats[i]);
+            
+            // Set the parameter
+            char *set_argv[] = {"set", (char*)param, (char*)formats[i]};
+            cmd_set(3, set_argv);
+            
+            // Display one frame
+            ESP_LOGI(TAG, "Testing %s=%s...", param, formats[i]);
+            cmd_oneframe(0, NULL);
+            
+            // Wait for user observation
+            ESP_LOGI(TAG, "Displaying for %dms - observe the result", delay_ms);
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        }
+    } else {
+        for (int value = start; value <= end; value += step) {
+            ESP_LOGI(TAG, "\n=== SWEEP: %s = %d ===", param, value);
+            
+            // Set the parameter
+            char val_str[16];
+            snprintf(val_str, sizeof(val_str), "%d", value);
+            char *set_argv[] = {"set", (char*)param, val_str};
+            cmd_set(3, set_argv);
+            
+            // Display one frame
+            ESP_LOGI(TAG, "Testing %s=%d...", param, value);
+            cmd_oneframe(0, NULL);
+            
+            // Wait for user observation
+            ESP_LOGI(TAG, "Displaying for %dms - observe the result", delay_ms);
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        }
     }
     
     // Restore original value
-    ESP_LOGI(TAG, "Sweep complete, restoring original %s=%d", param, original_value);
-    char orig_str[16];
-    snprintf(orig_str, sizeof(orig_str), "%d", original_value);
-    char *restore_argv[] = {"set", (char*)param, orig_str};
-    cmd_set(3, restore_argv);
+    if (is_string_param) {
+        ESP_LOGI(TAG, "Sweep complete, restoring original %s=%s", param, original_str_value);
+        char *restore_argv[] = {"set", (char*)param, original_str_value};
+        cmd_set(3, restore_argv);
+    } else {
+        ESP_LOGI(TAG, "Sweep complete, restoring original %s=%d", param, original_value);
+        char orig_str[16];
+        snprintf(orig_str, sizeof(orig_str), "%d", original_value);
+        char *restore_argv[] = {"set", (char*)param, orig_str};
+        cmd_set(3, restore_argv);
+    }
     
     return 0;
 }
@@ -998,6 +1150,201 @@ static int cmd_autotest(int argc, char** argv) {
     return 0;
 }
 
+// 'multisweep' command: test multiple probable parameter combinations
+// Usage: multisweep [panel_type] [delay_ms]
+static int cmd_multisweep(int argc, char** argv) {
+    const char *panel_type = argc >= 2 ? argv[1] : "ili9881c";
+    int delay_ms = argc >= 3 ? atoi(argv[2]) : 4000; // Default 4 seconds per config
+    
+    ESP_LOGI(TAG, "Starting multi-parameter sweep for panel type: %s (delay %dms)", panel_type, delay_ms);
+    
+    // Store original configuration
+    struct {
+        int dpi_clock_mhz, hs_bp, hs_fp, vs_bp, vs_fp, lane_rate_mbps;
+        char pixel_format[8];
+    } original = {
+        panel_cfg.dpi_clock_mhz, panel_cfg.hs_bp, panel_cfg.hs_fp,
+        panel_cfg.vs_bp, panel_cfg.vs_fp, panel_cfg.lane_rate_mbps,
+        ""
+    };
+    strncpy(original.pixel_format, panel_cfg.pixel_format, sizeof(original.pixel_format) - 1);
+    
+    // Define probable configurations for different panel types
+    typedef struct {
+        const char* name;
+        int dpi, hs_bp, hs_fp, vs_bp, vs_fp, lane_rate;
+        const char* pixel_format;
+        const char* description;
+    } panel_config_t;
+    
+    panel_config_t configs_ili9881c[] = {
+        // Known working configurations - RGB888
+        {"ESP-BSP Default", 60, 172, 32, 40, 26, 600, "RGB888", "Standard ESP-BSP configuration"},
+        {"Conservative", 55, 180, 40, 45, 30, 550, "RGB888", "Conservative timing for stability"},
+        {"Aggressive", 65, 160, 25, 35, 20, 650, "RGB888", "Higher performance timing"},
+        
+        // RGB565 variants for lower bandwidth
+        {"RGB565 Default", 60, 172, 32, 40, 26, 400, "RGB565", "RGB565 for lower bandwidth"},
+        {"RGB565 Conservative", 55, 180, 40, 45, 30, 370, "RGB565", "RGB565 conservative timing"},
+        {"RGB565 Fast", 65, 160, 25, 35, 20, 430, "RGB565", "RGB565 higher performance"},
+        
+        // Variations for troubleshooting
+        {"Long H-BP", 60, 200, 32, 40, 26, 600, "RGB888", "Extended horizontal back porch"},
+        {"Short H-BP", 60, 140, 32, 40, 26, 600, "RGB888", "Reduced horizontal back porch"},
+        {"High DPI", 70, 172, 32, 40, 26, 700, "RGB888", "Higher DPI clock frequency"},
+        {"Low DPI", 50, 172, 32, 40, 26, 500, "RGB888", "Lower DPI clock frequency"},
+        
+        // Alternative timings from different vendors
+        {"Vendor Alt 1", 58, 168, 28, 38, 24, 580, "RGB888", "Alternative vendor timing #1"},
+        {"Vendor Alt 2", 62, 176, 36, 42, 28, 620, "RGB888", "Alternative vendor timing #2"},
+        {"Reduced Lane Rate", 60, 172, 32, 40, 26, 500, "RGB888", "Lower lane rate for signal integrity"},
+    };
+    
+    panel_config_t configs_ek79007[] = {
+        // EK79007 specific configurations
+        {"EK79007 Standard", 60, 160, 30, 35, 25, 580, "RGB888", "Standard EK79007 timing"},
+        {"EK79007 Conservative", 55, 170, 35, 40, 30, 520, "RGB888", "Conservative EK79007 timing"},
+        {"EK79007 Performance", 65, 150, 25, 30, 20, 620, "RGB888", "Performance EK79007 timing"},
+        {"EK79007 Alt", 58, 165, 32, 37, 27, 560, "RGB888", "Alternative EK79007 timing"},
+        {"EK79007 RGB565", 60, 160, 30, 35, 25, 390, "RGB565", "EK79007 with RGB565 for efficiency"},
+    };
+    
+    panel_config_t configs_generic[] = {
+        // Generic MIPI DSI panel configurations
+        {"Generic Standard", 60, 160, 32, 40, 26, 600, "RGB888", "Standard MIPI DSI timing"},
+        {"Generic Safe", 50, 180, 40, 50, 35, 500, "RGB888", "Safe timing for unknown panels"},
+        {"Generic Fast", 70, 140, 25, 30, 20, 700, "RGB888", "Fast timing for high-end panels"},
+        {"Generic RGB565", 60, 160, 32, 40, 26, 400, "RGB565", "RGB565 for lower bandwidth"},
+    };
+    
+    // Select configuration set based on panel type
+    panel_config_t *configs;
+    int num_configs;
+    
+    if (strcmp(panel_type, "ili9881c") == 0) {
+        configs = configs_ili9881c;
+        num_configs = sizeof(configs_ili9881c) / sizeof(configs_ili9881c[0]);
+    } else if (strcmp(panel_type, "ek79007") == 0) {
+        configs = configs_ek79007;
+        num_configs = sizeof(configs_ek79007) / sizeof(configs_ek79007[0]);
+    } else if (strcmp(panel_type, "generic") == 0) {
+        configs = configs_generic;
+        num_configs = sizeof(configs_generic) / sizeof(configs_generic[0]);
+    } else {
+        ESP_LOGW(TAG, "Unknown panel type '%s'. Available: ili9881c, ek79007, generic", panel_type);
+        return 0;
+    }
+    
+    ESP_LOGI(TAG, "Testing %d configurations for %s panels\n", num_configs, panel_type);
+    
+    // Test each configuration
+    for (int i = 0; i < num_configs; i++) {
+        panel_config_t *cfg = &configs[i];
+        
+        ESP_LOGI(TAG, "\n=== CONFIG %d/%d: %s ===", i+1, num_configs, cfg->name);
+        ESP_LOGI(TAG, "Description: %s", cfg->description);
+        ESP_LOGI(TAG, "Parameters: DPI=%d, HS_BP=%d, HS_FP=%d, VS_BP=%d, VS_FP=%d, Lane=%d, Format=%s",
+                 cfg->dpi, cfg->hs_bp, cfg->hs_fp, cfg->vs_bp, cfg->vs_fp, cfg->lane_rate, cfg->pixel_format);
+        
+        // Apply configuration
+        panel_cfg.dpi_clock_mhz = cfg->dpi;
+        panel_cfg.hs_bp = cfg->hs_bp;
+        panel_cfg.hs_fp = cfg->hs_fp;
+        panel_cfg.vs_bp = cfg->vs_bp;
+        panel_cfg.vs_fp = cfg->vs_fp;
+        panel_cfg.lane_rate_mbps = cfg->lane_rate;
+        strncpy(panel_cfg.pixel_format, cfg->pixel_format, sizeof(panel_cfg.pixel_format) - 1);
+        panel_cfg.pixel_format[sizeof(panel_cfg.pixel_format) - 1] = '\0';
+        // Update bits per pixel based on format
+        if (strcmp(cfg->pixel_format, "RGB565") == 0) {
+            panel_cfg.bits_per_pixel = 16;
+        } else {
+            panel_cfg.bits_per_pixel = 24;
+        }
+        
+        // Test the configuration
+        ESP_LOGI(TAG, "Testing configuration...");
+        int result = cmd_oneframe(0, NULL);
+        
+        if (result == 0) {
+            ESP_LOGI(TAG, "✓ Configuration '%s' - Panel initialized successfully", cfg->name);
+            
+            // Run quick diagnostic if panel initialized
+            if (s_fb_buf != NULL && data_panel != NULL) {
+                ESP_LOGI(TAG, "Running quick diagnostic...");
+                
+                // Quick DMA timing test
+                uint32_t start_time = esp_timer_get_time();
+                esp_err_t ret = esp_lcd_panel_draw_bitmap(data_panel, 0, 0, 
+                                                          panel_cfg.h_size, panel_cfg.v_size, s_fb_buf);
+                if (ret == ESP_OK && draw_done_sem) {
+                    if (xSemaphoreTake(draw_done_sem, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                        uint32_t transfer_time_us = esp_timer_get_time() - start_time;
+                        float bandwidth_mbps = (s_fb_size * 8.0f) / transfer_time_us;
+                        ESP_LOGI(TAG, "  DMA: %.2f ms, %.2f Mbps", transfer_time_us/1000.0f, bandwidth_mbps);
+                        
+                        // Calculate lane utilization
+                        int total_pixels = panel_cfg.h_size * panel_cfg.v_size;
+                        int required_bandwidth = (total_pixels * panel_cfg.bits_per_pixel * 60) / 1000000; // 60Hz
+                        float utilization = (float)required_bandwidth / (cfg->lane_rate * 2) * 100.0f;
+                        ESP_LOGI(TAG, "  Lane utilization: %.1f%% @ 60Hz", utilization);
+                        
+                        // Quality assessment
+                        if (transfer_time_us < 50000 && bandwidth_mbps > 100 && utilization > 20 && utilization < 80) {
+                            ESP_LOGI(TAG, "  ★ EXCELLENT - All metrics within optimal range");
+                        } else if (transfer_time_us < 100000 && bandwidth_mbps > 50) {
+                            ESP_LOGI(TAG, "  ◐ GOOD - Acceptable performance");
+                        } else {
+                            ESP_LOGI(TAG, "  ◯ MARGINAL - May have performance issues");
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "  ◯ DMA timeout - possible timing issues");
+                    }
+                } else {
+                    ESP_LOGW(TAG, "  ◯ DMA initiation failed");
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "✗ Configuration '%s' - Panel initialization failed", cfg->name);
+        }
+        
+        // Wait for user observation
+        ESP_LOGI(TAG, "Displaying for %dms - observe result on panel...", delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        
+        // Brief pause between configs
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    // Restore original configuration
+    ESP_LOGI(TAG, "\n=== MULTISWEEP COMPLETE ===");
+    ESP_LOGI(TAG, "Restoring original configuration...");
+    
+    panel_cfg.dpi_clock_mhz = original.dpi_clock_mhz;
+    panel_cfg.hs_bp = original.hs_bp;
+    panel_cfg.hs_fp = original.hs_fp;
+    panel_cfg.vs_bp = original.vs_bp;
+    panel_cfg.vs_fp = original.vs_fp;
+    panel_cfg.lane_rate_mbps = original.lane_rate_mbps;
+    strncpy(panel_cfg.pixel_format, original.pixel_format, sizeof(panel_cfg.pixel_format) - 1);
+    panel_cfg.pixel_format[sizeof(panel_cfg.pixel_format) - 1] = '\0';
+    // Restore bits per pixel
+    if (strcmp(original.pixel_format, "RGB565") == 0) {
+        panel_cfg.bits_per_pixel = 16;
+    } else {
+        panel_cfg.bits_per_pixel = 24;
+    }
+    
+    cmd_oneframe(0, NULL);
+    
+    ESP_LOGI(TAG, "\n=== SUMMARY ===");
+    ESP_LOGI(TAG, "Tested %d configurations for %s panels", num_configs, panel_type);
+    ESP_LOGI(TAG, "Look for configurations marked with ★ (excellent) or ◐ (good)");
+    ESP_LOGI(TAG, "Use 'set' commands to apply the best working configuration");
+    
+    return 0;
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting display shell");
@@ -1009,6 +1356,7 @@ void app_main(void)
     ESP_ERROR_CHECK(console_cmd_user_register("start", cmd_start));
     ESP_ERROR_CHECK(console_cmd_user_register("oneframe", cmd_oneframe));
     ESP_ERROR_CHECK(console_cmd_user_register("sweep", cmd_sweep));
+    ESP_ERROR_CHECK(console_cmd_user_register("multisweep", cmd_multisweep));
     ESP_ERROR_CHECK(console_cmd_user_register("autotest", cmd_autotest));
     ESP_ERROR_CHECK(console_cmd_user_register("diagnose", cmd_diagnose));
     ESP_ERROR_CHECK(console_cmd_user_register("stop", cmd_stop));

@@ -104,6 +104,7 @@ sweep dpi 55 65 2
 | `diagnose` | Comprehensive system diagnostics | `diagnose` |
 | `peek` | Examine framebuffer contents | `peek 32` |
 | `sweep` | Parameter range testing | `sweep hs_bp 160 180 5` |
+| `multisweep` | Test multiple probable configurations | `multisweep ili9881c` |
 | `autotest` | Automated test sequence | `autotest quick` |
 
 ### Utility Commands
@@ -133,6 +134,7 @@ sweep dpi 55 65 2
 - `use_dma2d` - Enable DMA2D acceleration
 - `disable_lp` - Disable low-power mode
 - `color` - Default display color
+- `pixel_format` - Pixel format: RGB888 (24-bit) or RGB565 (16-bit)
 
 ## Troubleshooting Guide
 
@@ -166,16 +168,30 @@ autotest quick
 ```bash
 # Analyze performance
 diagnose
+
+# If high lane utilization (>80%), switch to RGB565
+set pixel_format RGB565
+oneframe
+diagnose
 ```
 **Monitor**: DMA transfer rates, lane utilization, memory alignment
+**Quick fix**: RGB565 reduces bandwidth by 33% vs RGB888
 
 ### Parameter Recommendations
 
 #### For ILI9881C (800x1280) Panels:
+**RGB888 (full color depth):**
 ```
 dpi=60, hs_bp=172, hs_fp=32, hs_pw=16
 vs_bp=40, vs_fp=26, vs_pw=4
-lanes=2, lane_rate=600
+lanes=2, lane_rate=600, pixel_format=RGB888
+```
+
+**RGB565 (reduced bandwidth):**
+```
+dpi=60, hs_bp=172, hs_fp=32, hs_pw=16
+vs_bp=40, vs_fp=26, vs_pw=4
+lanes=2, lane_rate=400, pixel_format=RGB565
 ```
 
 #### For Testing New Panels:
