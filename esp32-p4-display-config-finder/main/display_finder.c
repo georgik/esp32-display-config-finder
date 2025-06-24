@@ -66,14 +66,14 @@ static struct {
     .dpi_clock_mhz = 60,
     .h_size        = 800,
     .v_size        = 1280,
-    .hs_pw         = 16,
-    .hs_bp         = 172,
-    .hs_fp         = 32,
-    .vs_pw         = 4,
-    .vs_bp         = 40,
-    .vs_fp         = 26,
+    .hs_pw         = 16,         // Match working ESP-BSP example
+    .hs_bp         = 172,        // Match working ESP-BSP example (CRITICAL)
+    .hs_fp         = 32,         // Match working ESP-BSP example
+    .vs_pw         = 4,          // Match working ESP-BSP example
+    .vs_bp         = 40,         // Match working ESP-BSP example
+    .vs_fp         = 26,         // Match working ESP-BSP example
     .lanes         = 2, // P4: max 2 lanes
-    .lane_rate_mbps = 520,
+    .lane_rate_mbps = 600,       // Match working ESP-BSP example
     .ldo_vci_chan   = 3,    // default VCI LDO channel
     .ldo_vci_mv     = 2700, // default analog voltage (mV)
     .ldo_iovcc_chan = 2,    // default IOVCC LDO channel
@@ -114,6 +114,7 @@ static size_t s_fb_size = 0;
 
 // Forward declarations
 static void panel_loop(void *pvParameters);
+static void cleanup_panel(void);
 
 // 'show' command: display current config
 static int cmd_show(int argc, char** argv) {
@@ -186,6 +187,203 @@ static int cmd_stop(int argc, char** argv) {
     while (panel_task_handle) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    return 0;
+}
+
+// 'oneframe' command: initialize panel and push a single frame without continuous loop
+static int cmd_oneframe(int argc, char** argv) {
+    esp_err_t ret = ESP_OK;
+    
+    // Stop any running panel task first
+    if (panel_running || panel_task_handle) {
+        cmd_stop(0, NULL);
+    }
+    
+    ESP_LOGI(TAG, "Single frame mode - initializing panel...");
+    
+    // Power up MIPI DSI PHY: analog (VCI) and logic (IOVCC) rails
+    esp_ldo_channel_handle_t ldo_vci = NULL;
+    esp_ldo_channel_config_t ldo_vci_cfg = {
+        .chan_id    = panel_cfg.ldo_vci_chan,
+        .voltage_mv = panel_cfg.ldo_vci_mv,
+    };
+    ret = esp_ldo_acquire_channel(&ldo_vci_cfg, &ldo_vci);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to acquire VCI LDO chan %d at %dmV: %s",
+                 panel_cfg.ldo_vci_chan, panel_cfg.ldo_vci_mv, esp_err_to_name(ret));
+    }
+
+    esp_ldo_channel_handle_t ldo_iovcc = NULL;
+    esp_ldo_channel_config_t ldo_iovcc_cfg = {
+        .chan_id    = panel_cfg.ldo_iovcc_chan,
+        .voltage_mv = panel_cfg.ldo_iovcc_mv,
+    };
+    ret = esp_ldo_acquire_channel(&ldo_iovcc_cfg, &ldo_iovcc);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to acquire IOVCC LDO chan %d at %dmV: %s",
+                 panel_cfg.ldo_iovcc_chan, panel_cfg.ldo_iovcc_mv, esp_err_to_name(ret));
+    }
+
+    ESP_LOGI(TAG, "Reconfiguring panel...");
+    cleanup_panel();
+
+    // Calculate lane bit rate based on pixel clock (MHz), bits per pixel (24 for RGB888), and number of lanes
+    int default_rate = panel_cfg.dpi_clock_mhz * 24 / (panel_cfg.lanes * 2);
+    int lane_rate_mbps = panel_cfg.lane_rate_mbps > 0 ? panel_cfg.lane_rate_mbps : default_rate;
+    ESP_LOGI(TAG, "DSI lane bit rate: %d Mbps (default %d)", lane_rate_mbps, default_rate);
+
+    // 1) DSI bus
+    esp_lcd_dsi_bus_config_t bus_cfg = {
+        .bus_id             = 0,
+        .num_data_lanes     = panel_cfg.lanes,     // number of DSI data lanes
+        .phy_clk_src        = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
+        .lane_bit_rate_mbps = lane_rate_mbps,
+    };
+    ret = esp_lcd_new_dsi_bus(&bus_cfg, &dsi_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create DSI bus: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    ESP_LOGI(TAG, "DSI bus created successfully");
+
+    // Create DBI IO for control commands
+    esp_lcd_dbi_io_config_t dbi_cfg = {
+        .virtual_channel = 0,
+        .lcd_cmd_bits    = 8,
+        .lcd_param_bits  = 8,
+    };
+    ret = esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_cfg, &io_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create DBI IO: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    ESP_LOGI(TAG, "DBI IO created");
+
+    // DPI timing
+    esp_lcd_dpi_panel_config_t dpi_cfg = {
+        .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
+        .dpi_clock_freq_mhz = panel_cfg.dpi_clock_mhz,
+        .virtual_channel    = 0,
+        .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
+        .in_color_format    = LCD_COLOR_FMT_RGB888,
+        .out_color_format   = LCD_COLOR_FMT_RGB888,
+        .num_fbs            = 1,
+        .video_timing = {
+            .h_size            = panel_cfg.h_size,
+            .v_size            = panel_cfg.v_size,
+            .hsync_pulse_width = panel_cfg.hs_pw,
+            .hsync_back_porch  = panel_cfg.hs_bp,
+            .hsync_front_porch = panel_cfg.hs_fp,
+            .vsync_pulse_width = panel_cfg.vs_pw,
+            .vsync_back_porch  = panel_cfg.vs_bp,
+            .vsync_front_porch = panel_cfg.vs_fp,
+        },
+        .flags.use_dma2d   = panel_cfg.use_dma2d,
+        .flags.disable_lp   = panel_cfg.disable_lp,
+    };
+
+    // Vendor config with Yeebo-specific initialization
+    ili9881c_vendor_config_t vendor_cfg = {
+        .mipi_config = { .dsi_bus = dsi_bus, .dpi_config = &dpi_cfg, .lane_num = panel_cfg.lanes },
+        .init_cmds = vendor_specific_init_yeebo,
+        .init_cmds_size = vendor_specific_init_yeebo_size
+    };
+
+    // Install control panel driver
+    esp_lcd_panel_dev_config_t ctrl_cfg = {
+        .reset_gpio_num = GPIO_NUM_27, // no reset GPIO
+        .rgb_ele_order  = BSP_LCD_COLOR_SPACE,
+        .bits_per_pixel = 24,
+        .vendor_config  = &vendor_cfg,  // reuse vendor_cfg
+    };
+    ESP_LOGI(TAG, "Creating ILI9881C control panel...");
+    ret = esp_lcd_new_panel_ili9881c(io_handle, &ctrl_cfg, &ctrl_panel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Control panel creation failed: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    ESP_LOGI(TAG, "Control panel created");
+
+    ESP_LOGI(TAG, "Resetting control panel...");
+    ret = esp_lcd_panel_reset(ctrl_panel);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Control reset failed: %s", esp_err_to_name(ret)); return 1; }
+    ESP_LOGI(TAG, "Init control panel...");
+    ret = esp_lcd_panel_init(ctrl_panel);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Control init failed: %s", esp_err_to_name(ret)); return 1; }
+    ESP_LOGI(TAG, "Turning on control panel display...");
+    ret = esp_lcd_panel_disp_on_off(ctrl_panel, true);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Control display on failed: %s", esp_err_to_name(ret)); return 1; }
+
+    // Create DPI data panel for pixel transfers
+    ESP_LOGI(TAG, "Creating DPI data panel...");
+    ret = esp_lcd_new_panel_dpi(dsi_bus, &dpi_cfg, &data_panel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DPI panel creation failed: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    ESP_LOGI(TAG, "DPI panel created");
+    ESP_LOGI(TAG, "Init DPI panel...");
+    ret = esp_lcd_panel_init(data_panel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DPI init failed: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    ESP_LOGI(TAG, "Turning on data panel display...");
+    ret = esp_lcd_panel_disp_on_off(data_panel, true);
+    if (ret == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "DPI panel disp_on_off not supported; continuing without explicit display-on call");
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DPI display on failed: %s", esp_err_to_name(ret));
+    }
+
+    // Create binary semaphore for draw completion
+    draw_done_sem = xSemaphoreCreateBinary();
+    if (!draw_done_sem) {
+        ESP_LOGE(TAG, "Failed to create draw_done_sem");
+    } else {
+        esp_lcd_dpi_panel_event_callbacks_t cbs = {
+            .on_color_trans_done = color_trans_done_cb,
+        };
+        ESP_ERROR_CHECK(esp_lcd_dpi_panel_register_event_callbacks(data_panel, &cbs, NULL));
+    }
+
+    // Use DPI panel's internal frame buffer
+    void *fb_ptr = NULL;
+    ESP_LOGI(TAG, "Getting internal frame buffer from DPI panel");
+    ret = esp_lcd_dpi_panel_get_frame_buffer(data_panel, 1, &fb_ptr);
+    if (ret != ESP_OK || !fb_ptr) {
+        ESP_LOGE(TAG, "Failed to get DPI frame buffer: %s", esp_err_to_name(ret));
+        cleanup_panel();
+        return 1;
+    }
+    s_fb_buf = (uint8_t*)fb_ptr;
+    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3; // 3 bytes per pixel
+    ESP_LOGI(TAG, "Using DPI internal frame buffer at %p, size %u bytes", s_fb_buf, (unsigned)s_fb_size);
+
+    // Determine RGB values based on current color setting
+    uint8_t r, g, b;
+    get_rgb_for_color(panel_cfg.color_name, &r, &g, &b);
+    ESP_LOGI(TAG, "Single frame color: %s (R:%d, G:%d, B:%d)", panel_cfg.color_name, r, g, b);
+
+    // Fill the internal framebuffer with the selected color
+    for (size_t i = 0; i < s_fb_size; i += 3) {
+        s_fb_buf[i + 0] = b;  // Blue component
+        s_fb_buf[i + 1] = g;  // Green component
+        s_fb_buf[i + 2] = r;  // Red component
+    }
+    ESP_LOGI(TAG, "Frame buffer filled with color");
+    
+    // Push single frame to panel
+    ESP_LOGI(TAG, "Pushing single frame to panel");
+    esp_lcd_panel_draw_bitmap(data_panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, s_fb_buf);
+    if (draw_done_sem) {
+        xSemaphoreTake(draw_done_sem, portMAX_DELAY);
+    }
+    ESP_LOGI(TAG, "Single frame displayed successfully!");
+    
+    // Keep the display on but stop here (no continuous refresh)
+    ESP_LOGI(TAG, "Single frame mode complete - panel initialized and single frame displayed");
+    
     return 0;
 }
 
@@ -329,9 +527,11 @@ static void panel_loop(void *pvParameters) {
         .flags.disable_lp   = panel_cfg.disable_lp,
     };
 
-    // Vendor config
+    // Vendor config with Yeebo-specific initialization
     ili9881c_vendor_config_t vendor_cfg = {
-        .mipi_config = { .dsi_bus = dsi_bus, .dpi_config = &dpi_cfg, .lane_num = panel_cfg.lanes }
+        .mipi_config = { .dsi_bus = dsi_bus, .dpi_config = &dpi_cfg, .lane_num = panel_cfg.lanes },
+        .init_cmds = vendor_specific_init_yeebo,
+        .init_cmds_size = vendor_specific_init_yeebo_size
     };
 
     // Install control panel driver
@@ -393,15 +593,18 @@ static void panel_loop(void *pvParameters) {
         ESP_ERROR_CHECK(esp_lcd_dpi_panel_register_event_callbacks(data_panel, &cbs, NULL));
     }
 
-    // Allocate our own DMA-capable frame buffer for full-screen RGB888
-    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3; // 3 bytes per pixel
-    ESP_LOGI(TAG, "Allocating framebuffer of size %u bytes", (unsigned)s_fb_size);
-    s_fb_buf = heap_caps_malloc(s_fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    if (!s_fb_buf) {
-        ESP_LOGE(TAG, "Failed to allocate framebuffer");
+    // Use DPI panel's internal frame buffer instead of manual allocation
+    void *fb_ptr = NULL;
+    ESP_LOGI(TAG, "Getting internal frame buffer from DPI panel");
+    ret = esp_lcd_dpi_panel_get_frame_buffer(data_panel, 1, &fb_ptr);
+    if (ret != ESP_OK || !fb_ptr) {
+        ESP_LOGE(TAG, "Failed to get DPI frame buffer: %s", esp_err_to_name(ret));
         cleanup_panel();
         return;
     }
+    s_fb_buf = (uint8_t*)fb_ptr;
+    s_fb_size = panel_cfg.h_size * panel_cfg.v_size * 3; // 3 bytes per pixel
+    ESP_LOGI(TAG, "Using DPI internal frame buffer at %p, size %u bytes", s_fb_buf, (unsigned)s_fb_size);
 
     // Determine initial RGB values based on current color setting
     uint8_t r, g, b;
@@ -421,29 +624,42 @@ static void panel_loop(void *pvParameters) {
         xSemaphoreTake(draw_done_sem, portMAX_DELAY);
     }
 
-    // Continuous update loop: only modify the buffer and delay
+    // Automatic color rotation cycle
+    const char* color_cycle[] = {"red", "green", "blue", "white", "black"};
+    const int cycle_length = sizeof(color_cycle) / sizeof(color_cycle[0]);
+    int color_index = 0;
+    
+    // Continuous update loop with automatic color cycling
     while (panel_running) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        // On each iteration, re-read the color setting and refill
-        get_rgb_for_color(panel_cfg.color_name, &r, &g, &b);
-
+        // Automatically cycle through colors
+        const char* current_color = color_cycle[color_index];
+        get_rgb_for_color(current_color, &r, &g, &b);
+        
+        ESP_LOGI(TAG, "Displaying color: %s (R:%d, G:%d, B:%d)", current_color, r, g, b);
+        
+        // Fill buffer with current color
         for (size_t i = 0; i < s_fb_size; i += 3) {
-            s_fb_buf[i + 0] = b;
-            s_fb_buf[i + 1] = g;
-            s_fb_buf[i + 2] = r;
+            s_fb_buf[i + 0] = b;  // Blue component
+            s_fb_buf[i + 1] = g;  // Green component  
+            s_fb_buf[i + 2] = r;  // Red component
         }
+        
         // Push updated buffer to panel
         esp_lcd_panel_draw_bitmap(data_panel, 0, 0, panel_cfg.h_size, panel_cfg.v_size, s_fb_buf);
         if (draw_done_sem) {
             xSemaphoreTake(draw_done_sem, portMAX_DELAY);
         }
+        
+        // Move to next color in cycle
+        color_index = (color_index + 1) % cycle_length;
+        
+        // Wait 1 second before next color
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     //esp_lcd_panel_disp_on_off(data_panel, false);
     esp_lcd_panel_disp_on_off(ctrl_panel, false);
-    if (s_fb_buf) {
-        heap_caps_free(s_fb_buf);
-        s_fb_buf = NULL;
-    }
+    // s_fb_buf now points to DPI internal buffer, don't free it manually
+    s_fb_buf = NULL;
     cleanup_panel();
     if (draw_done_sem) {
         vSemaphoreDelete(draw_done_sem);
@@ -463,9 +679,14 @@ void app_main(void)
     ESP_ERROR_CHECK(console_cmd_user_register("show", cmd_show));
     ESP_ERROR_CHECK(console_cmd_user_register("set", cmd_set));
     ESP_ERROR_CHECK(console_cmd_user_register("start", cmd_start));
+    ESP_ERROR_CHECK(console_cmd_user_register("oneframe", cmd_oneframe));
     ESP_ERROR_CHECK(console_cmd_user_register("stop", cmd_stop));
     ESP_ERROR_CHECK(console_cmd_user_register("reboot", cmd_reboot));
     ESP_ERROR_CHECK(console_cmd_user_register("peek", cmd_peek));
     ESP_ERROR_CHECK(console_cmd_all_register());
     ESP_ERROR_CHECK(console_cmd_start());
+    
+    // Auto-execute "show" command on boot
+    ESP_LOGI(TAG, "Auto-executing 'show' command:");
+    cmd_show(0, NULL);
 }
