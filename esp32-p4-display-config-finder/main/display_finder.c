@@ -115,6 +115,8 @@ static size_t s_fb_size = 0;
 // Forward declarations
 static void panel_loop(void *pvParameters);
 static void cleanup_panel(void);
+static int cmd_sweep(int argc, char** argv);
+static int cmd_autotest(int argc, char** argv);
 
 // 'show' command: display current config
 static int cmd_show(int argc, char** argv) {
@@ -670,6 +672,164 @@ static void panel_loop(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+// 'sweep' command: iterate through a parameter range
+// Usage: sweep <param> <start> <end> <step> [delay_ms]
+static int cmd_sweep(int argc, char** argv) {
+    if (argc < 5) {
+        printf("Usage: sweep <param> <start> <end> <step> [delay_ms]\n");
+        printf("Example: sweep hs_bp 100 200 10 2000\n");
+        return 0;
+    }
+    
+    const char *param = argv[1];
+    int start = atoi(argv[2]);
+    int end = atoi(argv[3]);
+    int step = atoi(argv[4]);
+    int delay_ms = argc >= 6 ? atoi(argv[5]) : 3000; // Default 3 seconds
+    
+    ESP_LOGI(TAG, "Starting parameter sweep: %s from %d to %d step %d (delay %dms)", 
+             param, start, end, step, delay_ms);
+    
+    // Store original value to restore later
+    int original_value = 0;
+    if      (strcmp(param, "dpi") == 0) original_value = panel_cfg.dpi_clock_mhz;
+    else if (strcmp(param, "hs_pw") == 0) original_value = panel_cfg.hs_pw;
+    else if (strcmp(param, "hs_bp") == 0) original_value = panel_cfg.hs_bp;
+    else if (strcmp(param, "hs_fp") == 0) original_value = panel_cfg.hs_fp;
+    else if (strcmp(param, "vs_pw") == 0) original_value = panel_cfg.vs_pw;
+    else if (strcmp(param, "vs_bp") == 0) original_value = panel_cfg.vs_bp;
+    else if (strcmp(param, "vs_fp") == 0) original_value = panel_cfg.vs_fp;
+    else if (strcmp(param, "lane_rate") == 0) original_value = panel_cfg.lane_rate_mbps;
+    else {
+        printf("Unsupported parameter for sweep: %s\n", param);
+        return 0;
+    }
+    
+    for (int value = start; value <= end; value += step) {
+        ESP_LOGI(TAG, "\n=== SWEEP: %s = %d ===", param, value);
+        
+        // Set the parameter
+        char val_str[16];
+        snprintf(val_str, sizeof(val_str), "%d", value);
+        char *set_argv[] = {"set", (char*)param, val_str};
+        cmd_set(3, set_argv);
+        
+        // Display one frame
+        ESP_LOGI(TAG, "Testing %s=%d...", param, value);
+        cmd_oneframe(0, NULL);
+        
+        // Wait for user observation
+        ESP_LOGI(TAG, "Displaying for %dms - observe the result", delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    
+    // Restore original value
+    ESP_LOGI(TAG, "Sweep complete, restoring original %s=%d", param, original_value);
+    char orig_str[16];
+    snprintf(orig_str, sizeof(orig_str), "%d", original_value);
+    char *restore_argv[] = {"set", (char*)param, orig_str};
+    cmd_set(3, restore_argv);
+    
+    return 0;
+}
+
+// 'autotest' command: comprehensive automated testing
+// Usage: autotest [quick|full]
+static int cmd_autotest(int argc, char** argv) {
+    const char *mode = argc >= 2 ? argv[1] : "quick";
+    bool quick = strcmp(mode, "full") != 0;
+    
+    ESP_LOGI(TAG, "Starting automated test sequence (%s mode)", quick ? "quick" : "full");
+    
+    // Test sequence: colors first, then critical timing parameters
+    const char* colors[] = {"red", "green", "blue", "white", "black"};
+    const int num_colors = sizeof(colors) / sizeof(colors[0]);
+    
+    // 1. Color rotation test
+    ESP_LOGI(TAG, "\n=== PHASE 1: COLOR ROTATION TEST ===");
+    for (int i = 0; i < num_colors; i++) {
+        ESP_LOGI(TAG, "Testing color: %s", colors[i]);
+        char *color_argv[] = {"set", "color", (char*)colors[i]};
+        cmd_set(3, color_argv);
+        cmd_oneframe(0, NULL);
+        vTaskDelay(pdMS_TO_TICKS(2000)); // 2 seconds per color
+    }
+    
+    // 2. Critical timing parameter tests
+    if (quick) {
+        ESP_LOGI(TAG, "\n=== PHASE 2: QUICK TIMING TESTS ===");
+        
+        // Test horizontal back porch (most critical)
+        ESP_LOGI(TAG, "Testing horizontal back porch variations...");
+        int hs_bp_values[] = {150, 160, 172, 180, 190};
+        for (int i = 0; i < 5; i++) {
+            char val_str[16];
+            snprintf(val_str, sizeof(val_str), "%d", hs_bp_values[i]);
+            char *argv_set[] = {"set", "hs_bp", val_str};
+            cmd_set(3, argv_set);
+            ESP_LOGI(TAG, "Testing hs_bp=%d", hs_bp_values[i]);
+            cmd_oneframe(0, NULL);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+        
+        // Test DPI clock
+        ESP_LOGI(TAG, "Testing DPI clock variations...");
+        int dpi_values[] = {50, 55, 60, 65, 70};
+        for (int i = 0; i < 5; i++) {
+            char val_str[16];
+            snprintf(val_str, sizeof(val_str), "%d", dpi_values[i]);
+            char *argv_set[] = {"set", "dpi", val_str};
+            cmd_set(3, argv_set);
+            ESP_LOGI(TAG, "Testing dpi=%d MHz", dpi_values[i]);
+            cmd_oneframe(0, NULL);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+    } else {
+        ESP_LOGI(TAG, "\n=== PHASE 2: FULL TIMING PARAMETER SWEEP ===");
+        
+        // Comprehensive parameter sweep
+        struct { const char *param; int start, end, step; } sweeps[] = {
+            {"hs_bp", 140, 200, 10},
+            {"hs_fp", 20, 50, 5},
+            {"vs_bp", 30, 50, 5},
+            {"vs_fp", 20, 35, 3},
+            {"dpi", 50, 75, 5}
+        };
+        
+        for (int i = 0; i < 5; i++) {
+            ESP_LOGI(TAG, "Sweeping %s from %d to %d step %d", 
+                     sweeps[i].param, sweeps[i].start, sweeps[i].end, sweeps[i].step);
+            
+            char start_str[16], end_str[16], step_str[16];
+            snprintf(start_str, sizeof(start_str), "%d", sweeps[i].start);
+            snprintf(end_str, sizeof(end_str), "%d", sweeps[i].end);
+            snprintf(step_str, sizeof(step_str), "%d", sweeps[i].step);
+            
+            char *sweep_argv[] = {"sweep", (char*)sweeps[i].param, start_str, end_str, step_str, "2500"};
+            cmd_sweep(6, sweep_argv);
+        }
+    }
+    
+    ESP_LOGI(TAG, "\n=== AUTOTEST COMPLETE ===");
+    ESP_LOGI(TAG, "Restoring default configuration...");
+    
+    // Restore defaults
+    char *restore_cmds[][3] = {
+        {"set", "color", "blue"},
+        {"set", "hs_bp", "172"},
+        {"set", "dpi", "60"}
+    };
+    
+    for (int i = 0; i < 3; i++) {
+        cmd_set(3, restore_cmds[i]);
+    }
+    
+    cmd_oneframe(0, NULL);
+    ESP_LOGI(TAG, "Autotest sequence finished!");
+    
+    return 0;
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting display shell");
@@ -680,6 +840,8 @@ void app_main(void)
     ESP_ERROR_CHECK(console_cmd_user_register("set", cmd_set));
     ESP_ERROR_CHECK(console_cmd_user_register("start", cmd_start));
     ESP_ERROR_CHECK(console_cmd_user_register("oneframe", cmd_oneframe));
+    ESP_ERROR_CHECK(console_cmd_user_register("sweep", cmd_sweep));
+    ESP_ERROR_CHECK(console_cmd_user_register("autotest", cmd_autotest));
     ESP_ERROR_CHECK(console_cmd_user_register("stop", cmd_stop));
     ESP_ERROR_CHECK(console_cmd_user_register("reboot", cmd_reboot));
     ESP_ERROR_CHECK(console_cmd_user_register("peek", cmd_peek));
